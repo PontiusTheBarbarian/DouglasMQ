@@ -5,7 +5,7 @@ branches:
     tag: useBranchName
     increment: Minor
     regex: ^(?!main).*
-  master:
+  main:
     tag: ''
     increment: Minor
     regex: ^main$
