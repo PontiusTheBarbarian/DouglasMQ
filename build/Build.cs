@@ -42,7 +42,6 @@ public sealed class VersionTask : FrostingTask<BuildContext>
 				? GitVersionOutput.BuildServer
 				: GitVersionOutput.Json,
 			Verbosity = GitVersionVerbosity.Verbose,
-			UpdateProjectFiles = context.IsRunningOnBuildServer,
 			Diag = true
 		});
 
