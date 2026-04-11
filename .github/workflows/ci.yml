@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel in-progress runs for the same branch — equivalent to Azure Pipelines batch: true
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # GitVersion needs the full commit history to calculate semver
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.x"
+
+      - name: Run Cake build
+        run: chmod +x ./build.sh && ./build.sh
+        env:
+          CI: true
+          ARTIFACT_DIRECTORY: ${{ github.workspace }}/artifacts
+          SOLUTION_FILE: ${{ github.workspace }}/DouglasMQ.sln
+          NUGET_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload NuGet packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages
+          path: ${{ github.workspace }}/artifacts/NuGet/
+
+      - name: Upload build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: ${{ github.workspace }}/artifacts/reports/
+          if-no-files-found: ignore

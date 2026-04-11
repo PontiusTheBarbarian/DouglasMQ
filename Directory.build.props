@@ -1,0 +1,32 @@
+﻿<Project>
+	<PropertyGroup>
+		<Authors>Liam Appleyard</Authors>
+		<Company>Goodboy</Company>
+		<IsPackable>false</IsPackable>
+		<Version>0.0.1</Version>
+		<AssemblyInformationalVersion>0.0.1</AssemblyInformationalVersion>
+		<AssemblyFileVersion>0.0.1</AssemblyFileVersion>
+		<AssemblyVersion>0.0.1</AssemblyVersion>
+		<Copyright>Copyright Goodboy © 2022</Copyright>
+		<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+
+		<!-- Use the latest C# language features across all projects -->
+		<LangVersion>latest</LangVersion>
+
+		<!-- Ensures byte-for-byte reproducible builds locally and in CI -->
+		<Deterministic>true</Deterministic>
+
+		<!-- In CI (when CI env var is set) lock down source paths for fully reproducible packages -->
+		<ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+	</PropertyGroup>
+	<ItemGroup>
+		<AdditionalFiles Include="$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildProjectDirectory), DouglasMQ.sln))\stylecop.json" Link="stylecop.json" />
+	</ItemGroup>
+	<PropertyGroup>
+		<CodeAnalysisRuleSet>$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildProjectDirectory), DouglasMQ.sln))\DouglasMQ.ruleset</CodeAnalysisRuleSet>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(BuildingInsideVisualStudio)' != 'true'">
+		<!-- Ideally this is always enabled, but that tends to hurt developer productivity -->
+		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+	</PropertyGroup>
+</Project>

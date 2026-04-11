@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<IsPackable>true</IsPackable>
+		<Nullable>enable</Nullable>
+
+		<!-- XML docs shipped in the package for IntelliSense -->
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+		<!-- NuGet package identity -->
+		<PackageId>DouglasMQ</PackageId>
+		<Description>A strongly-typed RabbitMQ wrapper for .NET with built-in retry, dead-lettering, QoS, and Microsoft DI support. Usable with or without a dependency injection container.</Description>
+		<PackageTags>rabbitmq;amqp;messaging;dotnet;microservices;pubsub</PackageTags>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageProjectUrl>https://github.com/yourusername/DouglasMQ</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/yourusername/DouglasMQ</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+
+		<!-- Source Link: lets NuGet consumers step through library source in their debugger -->
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<EmbedUntrackedSources>true</EmbedUntrackedSources>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+	</PropertyGroup>
+
+	<!-- Include README in the NuGet package -->
+	<ItemGroup>
+		<None Include="..\..\README.md" Pack="true" PackagePath="\"/>
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="RabbitMQ.Client" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+		<!-- Source Link for GitHub — enables debugger step-through of library source from NuGet -->
+		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+	</ItemGroup>
+
+</Project>

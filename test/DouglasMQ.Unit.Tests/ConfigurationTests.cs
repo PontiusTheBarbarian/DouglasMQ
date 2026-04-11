@@ -1,0 +1,83 @@
+using Xunit;
+
+namespace DouglasMQ.Unit.Tests
+{
+	public class ConfigurationTests
+	{
+		[Fact]
+		public void Default_ClientProvidedName_IsNotNull()
+		{
+			var config = new Configuration();
+			Assert.NotNull(config.ClientProvidedName);
+		}
+
+		[Fact]
+		public void Default_ClientProvidedName_FallsBackWhenEntryAssemblyIsNull()
+		{
+			// Simulates a context where GetEntryAssembly() returns null (e.g. test runner).
+			// The default is evaluated at field init time; we just verify it's never null/empty.
+			var config = new Configuration();
+			Assert.False(string.IsNullOrWhiteSpace(config.ClientProvidedName));
+		}
+
+		[Fact]
+		public void Default_Username_IsGuest()
+		{
+			Assert.Equal("guest", new Configuration().Username);
+		}
+
+		[Fact]
+		public void Default_Password_IsGuest()
+		{
+			Assert.Equal("guest", new Configuration().Password);
+		}
+
+		[Fact]
+		public void Default_VirtualHost_IsSlash()
+		{
+			Assert.Equal("/", new Configuration().VirtualHost);
+		}
+
+		[Fact]
+		public void Default_HostName_IsLocalhost()
+		{
+			Assert.Equal("localhost", new Configuration().HostName);
+		}
+
+		[Fact]
+		public void Default_UseSsl_IsFalse()
+		{
+			Assert.False(new Configuration().UseSsl);
+		}
+
+		[Fact]
+		public void Default_SslCertificateThumbprint_IsNull()
+		{
+			Assert.Null(new Configuration().SslCertificateThumbprint);
+		}
+
+		[Fact]
+		public void Default_PrefetchCount_Is10()
+		{
+			Assert.Equal(10, new Configuration().PrefetchCount);
+		}
+
+		[Fact]
+		public void Default_RetryCount_Is3()
+		{
+			Assert.Equal(3, new Configuration().RetryCount);
+		}
+
+		[Fact]
+		public void Default_RetryDelayMs_Is1000()
+		{
+			Assert.Equal(1000, new Configuration().RetryDelayMs);
+		}
+
+		[Fact]
+		public void Default_PublisherConfirms_IsFalse()
+		{
+			Assert.False(new Configuration().PublisherConfirms);
+		}
+	}
+}

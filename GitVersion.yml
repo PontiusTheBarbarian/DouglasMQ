@@ -1,0 +1,13 @@
+mode: ContinuousDelivery
+assembly-versioning-scheme: MajorMinorPatch
+branches:
+  feature:
+    tag: useBranchName
+    increment: Minor
+    regex: ^(?!main).*
+  master:
+    tag: ''
+    increment: Minor
+    regex: ^main$
+ignore:
+  sha: []
