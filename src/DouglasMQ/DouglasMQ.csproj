@@ -34,8 +34,6 @@
 		<PackageReference Include="RabbitMQ.Client" />
 		<PackageReference Include="Microsoft.Extensions.Hosting" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
-		<!-- Source Link for GitHub — enables debugger step-through of library source from NuGet -->
-		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
 	</ItemGroup>
 
 </Project>

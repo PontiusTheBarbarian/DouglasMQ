@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Security;
 using System.Reflection;
-using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
 using DouglasMQ.Serialization;
@@ -91,13 +89,9 @@ namespace DouglasMQ
 		/// </summary>
 		public DouglasMQBuilder AddHandlersFromAssembly<TMarker>(Func<Type, object> handlerFactory)
 		{
-			var handlers = typeof(TMarker).Assembly
-				.GetTypes()
-				.Where(t =>
-					t.GetCustomAttribute<HandlerAttribute>() is not null &&
-					t.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IHandler<>)));
+			ArgumentNullException.ThrowIfNull(handlerFactory);
 
-			foreach (var handlerType in handlers)
+			foreach (var handlerType in HandlerDiscovery.FindHandlerTypes(typeof(TMarker).Assembly))
 			{
 				var attribute = handlerType.GetCustomAttribute<HandlerAttribute>()!;
 				var instance = handlerFactory(handlerType);
@@ -108,86 +102,81 @@ namespace DouglasMQ
 		}
 
 		/// <summary>
-		/// Builds a <see cref="IPublisher"/> connected to the configured broker.
-		/// The caller is responsible for disposing the returned publisher.
+		/// Builds a <see cref="IPublisher"/> with its own connection to the configured broker.
+		/// The publisher owns that connection: disposing the publisher closes it.
 		/// </summary>
 		public async Task<IPublisher> BuildPublisherAsync(CancellationToken cancellationToken = default)
 		{
 			EnsureSerializer();
-			var connection = await CreateConnectionAsync(cancellationToken);
-			return new Publisher(connection, _serializer!, _loggerFactory.CreateLogger<Publisher>(), _configuration);
+			var connection = await ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, ConnectionFactoryBuilder.PublisherSuffix, cancellationToken);
+			return new Publisher(connection, ownsConnection: true, _serializer!, _loggerFactory.CreateLogger<Publisher>(), _configuration);
 		}
 
 		/// <summary>
-		/// Creates the RabbitMQ connection, declares DLX topology, starts all registered consumers
-		/// and returns an <see cref="IAsyncDisposable"/> that stops them on disposal.
+		/// Opens a dedicated consumer connection, declares DLX topology, starts all registered
+		/// consumers and returns an <see cref="IAsyncDisposable"/> that stops them and closes the
+		/// connection on disposal.
 		/// </summary>
 		public async Task<IAsyncDisposable> StartConsumersAsync(CancellationToken cancellationToken = default)
 		{
 			EnsureSerializer();
-			var connection = await CreateConnectionAsync(cancellationToken);
-			var dispatcher = new Dispatcher(
-				connection,
-				BuildConsumers(connection),
-				_loggerFactory.CreateLogger<Dispatcher>());
+			var connection = await ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, ConnectionFactoryBuilder.ConsumerSuffix, cancellationToken);
 
-			await dispatcher.StartAsync(cancellationToken);
-			return dispatcher;
+			Dispatcher? dispatcher = null;
+			try
+			{
+				dispatcher = new Dispatcher(
+					connection,
+					BuildConsumers(connection),
+					_loggerFactory.CreateLogger<Dispatcher>());
+
+				await dispatcher.StartAsync(cancellationToken);
+				return dispatcher;
+			}
+			catch
+			{
+				// Startup failed part-way: release consumer channels and the connection rather
+				// than leaking them to the caller who never received a handle.
+				if (dispatcher is not null)
+				{
+					await dispatcher.DisposeAsync();
+				}
+				else
+				{
+					await connection.DisposeAsync();
+				}
+
+				throw;
+			}
 		}
 
 		/// <summary>
-		/// Builds a connected <see cref="IPublisher"/> and starts all consumers simultaneously,
-		/// returning both so the caller can publish and cleanly shut down consumers.
+		/// Builds a publisher and starts all consumers. Each uses its own connection (as RabbitMQ
+		/// recommends, so publisher flow control cannot stall consumers), and each is disposed
+		/// independently: stopping the consumers does not affect the publisher.
 		/// </summary>
 		public async Task<(IPublisher Publisher, IAsyncDisposable Consumers)> BuildAsync(CancellationToken cancellationToken = default)
 		{
 			EnsureSerializer();
-			var connection = await CreateConnectionAsync(cancellationToken);
-
-			var publisher = new Publisher(connection, _serializer!, _loggerFactory.CreateLogger<Publisher>(), _configuration);
-			var dispatcher = new Dispatcher(
-				connection,
-				BuildConsumers(connection),
-				_loggerFactory.CreateLogger<Dispatcher>());
-
-			await dispatcher.StartAsync(cancellationToken);
-			return (publisher, dispatcher);
+			var publisher = await BuildPublisherAsync(cancellationToken);
+			try
+			{
+				var consumers = await StartConsumersAsync(cancellationToken);
+				return (publisher, consumers);
+			}
+			catch
+			{
+				await ((IAsyncDisposable)publisher).DisposeAsync();
+				throw;
+			}
 		}
 
 		/// <summary>
 		/// Creates and returns a raw RabbitMQ connection using the current configuration.
 		/// The caller is responsible for closing and disposing the connection.
 		/// </summary>
-		public async Task<IConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
-		{
-			var factory = new ConnectionFactory
-			{
-				UserName = _configuration.Username,
-				Password = _configuration.Password,
-				VirtualHost = _configuration.VirtualHost,
-				ClientProvidedName = _configuration.ClientProvidedName,
-				HostName = _configuration.HostName,
-				AutomaticRecoveryEnabled = true,
-				TopologyRecoveryEnabled = true,
-				RequestedHeartbeat = TimeSpan.FromSeconds(60),
-			};
-
-			if (_configuration.UseSsl && _configuration.SslCertificateThumbprint is not null)
-			{
-				var certBytes = Convert.FromBase64String(_configuration.SslCertificateThumbprint);
-				factory.Ssl = new SslOption
-				{
-					Enabled = true,
-					Certs = new X509CertificateCollection
-					{
-						X509CertificateLoader.LoadCertificate(certBytes)
-					},
-					AcceptablePolicyErrors = SslPolicyErrors.RemoteCertificateNameMismatch | SslPolicyErrors.RemoteCertificateChainErrors,
-				};
-			}
-
-			return await factory.CreateConnectionAsync(cancellationToken);
-		}
+		public Task<IConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
+			=> ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, purpose: null, cancellationToken);
 
 		private List<Consumer> BuildConsumers(IConnection connection)
 		{

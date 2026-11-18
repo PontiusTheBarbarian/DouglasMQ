@@ -71,9 +71,9 @@ host.Run();
 | Service | Lifetime | Description |
 |---------|----------|-------------|
 | `Configuration` | Singleton | Resolved configuration values |
-| `IConnection` | Singleton | RabbitMQ connection (lazy — created on first resolve) |
+| `IConnection` | Singleton | Consumer connection, opened when the host starts and closed by the `Dispatcher` on stop |
 | `List<Consumer>` | Singleton | All discovered/registered consumer instances |
-| `IPublisher` | Singleton | `Publisher` instance for publishing messages |
+| `IPublisher` | Singleton | `Publisher` with its **own** connection, opened on first publish. It keeps working while the host stops, and the container closes it on disposal |
 | `Dispatcher` | `IHostedService` | Starts consumers on host start, stops on host stop |
 
 ## Individual extension methods

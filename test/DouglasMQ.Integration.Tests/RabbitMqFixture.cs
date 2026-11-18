@@ -12,7 +12,7 @@ namespace DouglasMQ.Integration.Tests
 	/// </summary>
 	public sealed class RabbitMqFixture : IAsyncLifetime
 	{
-		private readonly RabbitMqContainer _container = new RabbitMqBuilder()
+		private readonly RabbitMqContainer _container = new RabbitMqBuilder("rabbitmq:4.1")
 			.WithUsername("guest")
 			.WithPassword("guest")
 			.Build();
@@ -25,6 +25,7 @@ namespace DouglasMQ.Integration.Tests
 				.Configure(c =>
 				{
 					c.HostName = HostName;
+					c.Port = Port;
 					c.Username = "guest";
 					c.Password = "guest";
 					c.RetryCount = 2;

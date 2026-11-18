@@ -71,10 +71,25 @@ namespace DouglasMQ
 		/// <summary>
 		/// Stops the <see cref="Dispatcher"/> and closes the connection.
 		/// </summary>
-		public Task StopAsync(CancellationToken cancellationToken)
+		public async Task StopAsync(CancellationToken cancellationToken)
 		{
 			_logger.LogInformation("DouglasMQ dispatcher stopping.");
-			return _connection.CloseAsync(cancellationToken);
+			await StopConsumersAsync();
+
+			if (_connection.IsOpen)
+			{
+				await _connection.CloseAsync(cancellationToken);
+			}
+		}
+
+		private async Task StopConsumersAsync()
+		{
+			// Disposing a consumer cancels its in-flight processing token and closes its channel,
+			// so unfinished deliveries are returned to the broker rather than left dangling.
+			foreach (var consumer in _consumers)
+			{
+				await consumer.DisposeAsync();
+			}
 		}
 
 		/// <summary>
@@ -89,7 +104,12 @@ namespace DouglasMQ
 
 			try
 			{
-				await _connection.CloseAsync();
+				await StopConsumersAsync();
+
+				if (_connection.IsOpen)
+				{
+					await _connection.CloseAsync();
+				}
 			}
 			finally
 			{

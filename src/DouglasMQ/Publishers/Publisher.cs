@@ -3,6 +3,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using DouglasMQ.Messages;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
@@ -15,20 +16,49 @@ namespace DouglasMQ
 	/// </summary>
 	public sealed class Publisher : IPublisher, IAsyncDisposable
 	{
-		private readonly IConnection _connection;
+		private readonly Func<CancellationToken, Task<IConnection>>? _connectionFactory;
+		private readonly bool _ownsConnection;
 		private readonly ISerializer _serializer;
 		private readonly ILogger<Publisher> _logger;
 		private readonly bool _publisherConfirms;
 		private readonly SemaphoreSlim _channelLock = new SemaphoreSlim(1, 1);
-		private IChannel? _channel;
+		private IConnection? _connection;
+		private volatile IChannel? _channel;
 		private bool _disposed;
 
 		/// <summary>
-		/// Initializes a new instance of the <see cref="Publisher"/> class.
+		/// Initializes a new instance of the <see cref="Publisher"/> class over a connection owned by
+		/// the caller. Disposing the publisher closes its channel but leaves the connection open.
 		/// </summary>
 		public Publisher(IConnection connection, ISerializer serializer, ILogger<Publisher> logger, Configuration configuration)
+			: this(connection ?? throw new ArgumentNullException(nameof(connection)), ownsConnection: false, serializer, logger, configuration)
+		{
+		}
+
+		/// <summary>
+		/// Creates a publisher over an existing connection, optionally taking ownership of it.
+		/// </summary>
+		internal Publisher(IConnection connection, bool ownsConnection, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
 		{
 			_connection = connection ?? throw new ArgumentNullException(nameof(connection));
+			_ownsConnection = ownsConnection;
+			_serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
+			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
+			_publisherConfirms = configuration?.PublisherConfirms ?? false;
+		}
+
+		/// <summary>
+		/// Creates a publisher that opens (and owns) its own connection on first publish. Used by the
+		/// DI registration so resolving <see cref="IPublisher"/> never blocks on network I/O, and so
+		/// publishing is unaffected when the hosted consumers stop.
+		/// </summary>
+		internal static Publisher WithLazyConnection(Func<CancellationToken, Task<IConnection>> connectionFactory, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
+			=> new Publisher(connectionFactory, serializer, logger, configuration);
+
+		private Publisher(Func<CancellationToken, Task<IConnection>> connectionFactory, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
+		{
+			_connectionFactory = connectionFactory ?? throw new ArgumentNullException(nameof(connectionFactory));
+			_ownsConnection = true;
 			_serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
 			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
 			_publisherConfirms = configuration?.PublisherConfirms ?? false;
@@ -88,43 +118,73 @@ namespace DouglasMQ
 		}
 
 		private async ValueTask PublishCoreAsync<TMessage>(TMessage message, string exchangeName, string routingKey)
+			where TMessage : class, IMessage
 		{
+			ObjectDisposedException.ThrowIf(_disposed, this);
+
 			var channel = await GetOrCreateChannelAsync();
 			var body = Encoding.UTF8.GetBytes(_serializer.Serialize<TMessage>(message));
 
-			_logger.LogDebug("Publishing {MessageType} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
-				typeof(TMessage).Name, exchangeName, routingKey);
+			// Persistent (delivery mode 2) so messages survive a broker restart when routed to
+			// durable queues. Identity/correlation are surfaced as standard AMQP properties so
+			// they are visible to tooling and non-DouglasMQ consumers without deserializing the body.
+			var properties = new BasicProperties
+			{
+				Persistent = true,
+				MessageId = message.MessageId.ToString(),
+				CorrelationId = message.TraceId.ToString(),
+				Type = typeof(TMessage).FullName,
+				Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+			};
+
+			_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
+				typeof(TMessage).Name, message.MessageId, exchangeName, routingKey);
 
 			await channel.BasicPublishAsync(
 				exchange: exchangeName,
 				routingKey: routingKey,
-				body: body,
-				mandatory: false);
+				mandatory: false,
+				basicProperties: properties,
+				body: body);
 		}
 
 		private async ValueTask<IChannel> GetOrCreateChannelAsync()
 		{
-			if (_channel is not null)
+			var channel = _channel;
+			if (channel is { IsOpen: true })
 			{
-				return _channel;
+				return channel;
 			}
 
 			await _channelLock.WaitAsync();
 			try
 			{
-				if (_channel is null)
+				if (_channel is { IsOpen: true })
 				{
-					_logger.LogDebug("Creating publisher channel (publisherConfirms={PublisherConfirms}).", _publisherConfirms);
-
-					// In RabbitMQ.Client 7.x publisher confirms are enabled via CreateChannelOptions,
-					// not via ConfirmSelectAsync. When enabled the broker will ACK each BasicPublishAsync.
-					var options = new CreateChannelOptions(
-						publisherConfirmationsEnabled: _publisherConfirms,
-						publisherConfirmationTrackingEnabled: _publisherConfirms);
-
-					_channel = await _connection.CreateChannelAsync(options);
+					return _channel;
 				}
 
+				if (_channel is not null)
+				{
+					// A channel-level error (e.g. publishing to a missing exchange) makes the broker
+					// close the channel, and automatic recovery does not reopen it. Replace it so one
+					// bad publish does not poison every publish that follows.
+					_logger.LogWarning("Publisher channel was closed ({CloseReason}). Creating a new channel.", _channel.CloseReason);
+					var stale = _channel;
+					_channel = null;
+					await stale.DisposeAsync();
+				}
+
+				_logger.LogDebug("Creating publisher channel (publisherConfirms={PublisherConfirms}).", _publisherConfirms);
+
+				// In RabbitMQ.Client 7.x publisher confirms are enabled via CreateChannelOptions,
+				// not via ConfirmSelectAsync. When enabled the broker will ACK each BasicPublishAsync.
+				var options = new CreateChannelOptions(
+					publisherConfirmationsEnabled: _publisherConfirms,
+					publisherConfirmationTrackingEnabled: _publisherConfirms);
+
+				_connection ??= await _connectionFactory!(CancellationToken.None);
+				_channel = await _connection.CreateChannelAsync(options);
 				return _channel;
 			}
 			finally
@@ -134,7 +194,7 @@ namespace DouglasMQ
 		}
 
 		/// <summary>
-		/// Closes and disposes the publisher channel.
+		/// Closes and disposes the publisher channel, and the connection too if this publisher owns it.
 		/// </summary>
 		public async ValueTask DisposeAsync()
 		{
@@ -145,15 +205,35 @@ namespace DouglasMQ
 
 			_disposed = true;
 
-			if (_channel is not null)
+			var channel = _channel;
+			if (channel is not null)
 			{
 				try
 				{
-					await _channel.CloseAsync();
+					if (channel.IsOpen)
+					{
+						await channel.CloseAsync();
+					}
 				}
 				finally
 				{
-					await _channel.DisposeAsync();
+					await channel.DisposeAsync();
+				}
+			}
+
+			var connection = _connection;
+			if (_ownsConnection && connection is not null)
+			{
+				try
+				{
+					if (connection.IsOpen)
+					{
+						await connection.CloseAsync();
+					}
+				}
+				finally
+				{
+					await connection.DisposeAsync();
 				}
 			}
 
