@@ -27,9 +27,13 @@ All settings live in the `DouglasMQ.Configuration` class. When using Microsoft D
 | `Username` | `string` | `"guest"` | RabbitMQ username |
 | `Password` | `string` | `"guest"` | RabbitMQ password |
 | `VirtualHost` | `string` | `"/"` | RabbitMQ virtual host |
-| `ClientProvidedName` | `string` | entry assembly name | Name shown in the RabbitMQ management UI under *Connections* |
-| `UseSsl` | `bool` | `false` | Enable TLS for the broker connection |
-| `SslCertificateThumbprint` | `string?` | `null` | Base64-encoded X.509 certificate bytes, required when `UseSsl` is `true` |
+| `ClientProvidedName` | `string` | entry assembly name | Name shown in the RabbitMQ management UI under *Connections*. Publisher and consumer connections get `:publisher` / `:consumer` suffixes |
+| `Port` | `int` | `-1` | Broker port. `-1` uses the protocol default (5672, or 5671 with TLS) |
+| `UseSsl` | `bool` | `false` | Enable TLS. The broker certificate is fully validated unless `SslAcceptablePolicyErrors` says otherwise. No client certificate is needed unless the broker requires mutual TLS |
+| `SslServerName` | `string?` | `HostName` | Name expected on the broker's certificate. Set this when connecting by IP or through a load balancer |
+| `SslCertificateThumbprint` | `string?` | `null` | Optional Base64-encoded client certificate for mutual TLS. Despite the name this is the certificate itself: PKCS#12 (`.pfx`, keeps the private key) or DER/PEM |
+| `SslCertificatePassword` | `string?` | `null` | Password for a PKCS#12 client certificate |
+| `SslAcceptablePolicyErrors` | `SslPolicyErrors` | `None` | Certificate errors to tolerate. Leave as `None` in production; relaxing it disables man-in-the-middle protection |
 | `PrefetchCount` | `ushort` | `10` | Maximum number of unacknowledged messages delivered to each consumer channel at once. Lower values reduce memory pressure; higher values increase throughput. |
 | `RetryCount` | `int` | `3` | Number of retry attempts before a message is dead-lettered. Set to `0` to disable retries. |
 | `RetryDelayMs` | `int` | `1000` | Base delay in milliseconds between retry attempts. The actual delay for attempt *n* is `RetryDelayMs × 2^(n-1)` (exponential backoff). |
@@ -52,13 +56,27 @@ var builder = new DouglasMQBuilder()
 
 ## SSL / TLS
 
+Server-authenticated TLS (the common case) needs only `UseSsl`:
+
 ```csharp
 .Configure(c =>
 {
     c.HostName = "rabbitmq.internal";
     c.UseSsl = true;
-    c.SslCertificateThumbprint = Convert.ToBase64String(File.ReadAllBytes("cert.pfx"));
 })
 ```
 
-The certificate is loaded via `X509CertificateLoader.LoadCertificate` (the modern .NET 9+ API). The connection factory is configured to accept `RemoteCertificateNameMismatch` and `RemoteCertificateChainErrors` — review these for production deployments.
+The broker's certificate is validated against `SslServerName` (defaulting to `HostName`) and the machine's trusted roots.
+
+For mutual TLS, also supply a client certificate. Use a PKCS#12 file so the private key is included:
+
+```csharp
+c.SslCertificateThumbprint = Convert.ToBase64String(File.ReadAllBytes("client.pfx"));
+c.SslCertificatePassword = "pfx-password";
+```
+
+For local development against a self-signed broker certificate you can relax validation explicitly. Never ship this to production:
+
+```csharp
+c.SslAcceptablePolicyErrors = SslPolicyErrors.RemoteCertificateChainErrors;
+```

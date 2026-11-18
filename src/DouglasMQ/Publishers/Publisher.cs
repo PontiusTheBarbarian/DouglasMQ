@@ -16,20 +16,49 @@ namespace DouglasMQ
 	/// </summary>
 	public sealed class Publisher : IPublisher, IAsyncDisposable
 	{
-		private readonly IConnection _connection;
+		private readonly Func<CancellationToken, Task<IConnection>>? _connectionFactory;
+		private readonly bool _ownsConnection;
 		private readonly ISerializer _serializer;
 		private readonly ILogger<Publisher> _logger;
 		private readonly bool _publisherConfirms;
 		private readonly SemaphoreSlim _channelLock = new SemaphoreSlim(1, 1);
+		private IConnection? _connection;
 		private volatile IChannel? _channel;
 		private bool _disposed;
 
 		/// <summary>
-		/// Initializes a new instance of the <see cref="Publisher"/> class.
+		/// Initializes a new instance of the <see cref="Publisher"/> class over a connection owned by
+		/// the caller. Disposing the publisher closes its channel but leaves the connection open.
 		/// </summary>
 		public Publisher(IConnection connection, ISerializer serializer, ILogger<Publisher> logger, Configuration configuration)
+			: this(connection ?? throw new ArgumentNullException(nameof(connection)), ownsConnection: false, serializer, logger, configuration)
+		{
+		}
+
+		/// <summary>
+		/// Creates a publisher over an existing connection, optionally taking ownership of it.
+		/// </summary>
+		internal Publisher(IConnection connection, bool ownsConnection, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
 		{
 			_connection = connection ?? throw new ArgumentNullException(nameof(connection));
+			_ownsConnection = ownsConnection;
+			_serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
+			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
+			_publisherConfirms = configuration?.PublisherConfirms ?? false;
+		}
+
+		/// <summary>
+		/// Creates a publisher that opens (and owns) its own connection on first publish. Used by the
+		/// DI registration so resolving <see cref="IPublisher"/> never blocks on network I/O, and so
+		/// publishing is unaffected when the hosted consumers stop.
+		/// </summary>
+		internal static Publisher WithLazyConnection(Func<CancellationToken, Task<IConnection>> connectionFactory, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
+			=> new Publisher(connectionFactory, serializer, logger, configuration);
+
+		private Publisher(Func<CancellationToken, Task<IConnection>> connectionFactory, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
+		{
+			_connectionFactory = connectionFactory ?? throw new ArgumentNullException(nameof(connectionFactory));
+			_ownsConnection = true;
 			_serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
 			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
 			_publisherConfirms = configuration?.PublisherConfirms ?? false;
@@ -154,6 +183,7 @@ namespace DouglasMQ
 					publisherConfirmationsEnabled: _publisherConfirms,
 					publisherConfirmationTrackingEnabled: _publisherConfirms);
 
+				_connection ??= await _connectionFactory!(CancellationToken.None);
 				_channel = await _connection.CreateChannelAsync(options);
 				return _channel;
 			}
@@ -164,7 +194,7 @@ namespace DouglasMQ
 		}
 
 		/// <summary>
-		/// Closes and disposes the publisher channel.
+		/// Closes and disposes the publisher channel, and the connection too if this publisher owns it.
 		/// </summary>
 		public async ValueTask DisposeAsync()
 		{
@@ -188,6 +218,22 @@ namespace DouglasMQ
 				finally
 				{
 					await channel.DisposeAsync();
+				}
+			}
+
+			var connection = _connection;
+			if (_ownsConnection && connection is not null)
+			{
+				try
+				{
+					if (connection.IsOpen)
+					{
+						await connection.CloseAsync();
+					}
+				}
+				finally
+				{
+					await connection.DisposeAsync();
 				}
 			}
 

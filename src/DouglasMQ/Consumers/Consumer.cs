@@ -54,6 +54,12 @@ namespace DouglasMQ
 			_prefetchCount = configuration.PrefetchCount;
 		}
 
+		/// <summary>The queue this consumer reads from.</summary>
+		internal string QueueName => _attribute.QueueName;
+
+		/// <summary>The handler class this consumer dispatches to.</summary>
+		internal string HandlerName => _invoker.HandlerName;
+
 		/// <summary>
 		/// Creates a new <see cref="Consumer"/> from a <see cref="HandlerAttribute"/> and its handler instance.
 		/// </summary>

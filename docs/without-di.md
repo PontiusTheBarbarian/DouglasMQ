@@ -27,14 +27,14 @@ var builder = new DouglasMQBuilder()
 ```csharp
 await using var publisher = (Publisher)await builder.BuildPublisherAsync();
 await publisher.PublishAsync(new OrderPlaced { OrderId = "ORD-001" });
-// Disposed at end of using block
+// Disposing the publisher also closes its connection
 ```
 
 ### Consumers only
 
 ```csharp
 await using var consumers = await builder.StartConsumersAsync();
-// Consumers run until disposed
+// Consumers run until disposed; disposal also closes their connection
 await Task.Delay(Timeout.Infinite, cancellationToken);
 ```
 

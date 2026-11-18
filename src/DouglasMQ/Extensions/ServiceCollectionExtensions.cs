@@ -2,10 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using DouglasMQ.Messages;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 
@@ -70,23 +72,29 @@ namespace DouglasMQ
 		/// implement <see cref="IHandler{TMessage}"/> and are decorated with <see cref="HandlerAttribute"/>,
 		/// then registers each as a singleton.
 		/// </summary>
+		/// <exception cref="InvalidOperationException">
+		/// A decorated handler implements more than one <see cref="IHandler{TMessage}"/>. A handler
+		/// class maps to a single queue, so each message type needs its own handler class (or an
+		/// explicit <see cref="AddConsumer{TMessage, TImp}"/> registration).
+		/// </exception>
 		public static IServiceCollection AutoRegisterConsumers(this IServiceCollection services, Type assemblyMark)
 		{
-			const string HandleAsync = nameof(HandleAsync);
+			ArgumentNullException.ThrowIfNull(assemblyMark);
 
-			var handlers = Assembly.GetAssembly(assemblyMark)!
-				.GetTypes()
-				.Where(i =>
-					i.GetCustomAttribute<HandlerAttribute>() != null &&
-					i.GetInterfaces().Any(x => x.IsGenericType && x.GetGenericTypeDefinition() == typeof(IHandler<>)));
-
-			foreach (var handler in handlers)
+			foreach (var handlerType in HandlerDiscovery.FindHandlerTypes(assemblyMark.Assembly))
 			{
-				var parameter = handler.GetMethod(HandleAsync)!
-					.GetParameters()
-					.Single(p => p.ParameterType.GetCustomAttributes(typeof(MessageAttribute), true).Any());
+				var messageTypes = HandlerDiscovery.GetHandledMessageTypes(handlerType);
+				if (messageTypes.Count > 1)
+				{
+					throw new InvalidOperationException(
+						$"Handler '{handlerType.Name}' implements {messageTypes.Count} IHandler<T> interfaces but has a single " +
+						$"[{nameof(HandlerAttribute)}] queue, so its messages would compete on one queue. Split it into one " +
+						$"handler class per message type, or register it explicitly with {nameof(AddConsumer)}<TMessage, THandler>().");
+				}
 
-				services.AddSingleton(typeof(IHandler<>).MakeGenericType(parameter.ParameterType), handler);
+				// TryAddEnumerable: re-scanning, or scanning plus AddConsumer, must not register the
+				// same handler twice (which would start two consumers for it).
+				services.TryAddEnumerable(ServiceDescriptor.Singleton(typeof(IHandler<>).MakeGenericType(messageTypes[0]), handlerType));
 			}
 
 			return services;
@@ -98,7 +106,10 @@ namespace DouglasMQ
 		public static IServiceCollection AddConsumer<TMessage, TImp>(this IServiceCollection services)
 			where TMessage : class, IMessage
 			where TImp : class, IHandler<TMessage>
-			=> services.AddSingleton<IHandler<TMessage>, TImp>();
+		{
+			services.TryAddEnumerable(ServiceDescriptor.Singleton<IHandler<TMessage>, TImp>());
+			return services;
+		}
 
 		/// <summary>
 		/// Registers a serializer implementation.
@@ -109,49 +120,66 @@ namespace DouglasMQ
 		private static IServiceCollection AddDouglasMQ(this IServiceCollection services,
 			Configuration configuration) => services
 				.AddSingleton(configuration)
-				// Async connection creation is deferred to the Dispatcher's StartAsync to avoid
-				// blocking .Result calls during DI registration.
-				.AddSingleton<IConnection>(provider =>
-				{
-					var builder = new DouglasMQBuilder();
-					builder.Configure(c =>
-					{
-						c.Username = configuration.Username;
-						c.Password = configuration.Password;
-						c.VirtualHost = configuration.VirtualHost;
-						c.ClientProvidedName = configuration.ClientProvidedName;
-						c.HostName = configuration.HostName;
-						c.Port = configuration.Port;
-						c.UseSsl = configuration.UseSsl;
-						c.SslCertificateThumbprint = configuration.SslCertificateThumbprint;
-					});
-					// Safe to block here: IConnection is resolved lazily from the first consumer/publisher
-					// usage which occurs inside IHostedService.StartAsync (already on a thread pool thread).
-					return builder.CreateConnectionAsync().GetAwaiter().GetResult();
-				})
-				.AddSingleton<List<Consumer>>(provider =>
-				{
-					var connection = provider.GetRequiredService<IConnection>();
-					var serializer = provider.GetRequiredService<ISerializer>();
-					var logger = provider.GetRequiredService<ILogger<Consumer>>();
-
-					return services
-						.Where(service =>
-							service.ImplementationType?.GetCustomAttribute<HandlerAttribute>() != null &&
-							service.ServiceType.IsGenericType &&
-							service.ServiceType.GetGenericTypeDefinition() == typeof(IHandler<>))
-						.Select(service =>
-							Consumer.Create(
-								connection,
-								serializer,
-								logger,
-								configuration,
-								service.ImplementationType!.GetCustomAttribute<HandlerAttribute>()!,
-								provider.GetRequiredService(service.ServiceType),
-								service.ServiceType.GetGenericArguments()[0]))
-						.ToList();
-				})
-				.AddSingleton<IPublisher, Publisher>()
+				// The consumer connection, owned and closed by the hosted Dispatcher. Resolved when the
+				// host constructs the Dispatcher.
+				.AddSingleton<IConnection>(_ =>
+					ConnectionFactoryBuilder
+						.CreateConnectionAsync(configuration, ConnectionFactoryBuilder.ConsumerSuffix, CancellationToken.None)
+						.GetAwaiter()
+						.GetResult())
+				.AddSingleton<List<Consumer>>(provider => CreateConsumers(services, provider, configuration))
+				// The publisher gets its own lazily-opened connection rather than sharing the consumer
+				// connection, so it keeps working while the host is stopping (when the Dispatcher closes
+				// the consumer connection) and resolving it never blocks. The container disposes it.
+				.AddSingleton<IPublisher>(provider => Publisher.WithLazyConnection(
+					cancellationToken => ConnectionFactoryBuilder.CreateConnectionAsync(configuration, ConnectionFactoryBuilder.PublisherSuffix, cancellationToken),
+					provider.GetRequiredService<ISerializer>(),
+					provider.GetRequiredService<ILogger<Publisher>>(),
+					configuration))
 				.AddHostedService<Dispatcher>();
+
+		/// <summary>
+		/// Builds one consumer per registered <see cref="IHandler{TMessage}"/> — including factory and
+		/// instance registrations, and several handlers for the same message type.
+		/// </summary>
+		private static List<Consumer> CreateConsumers(IServiceCollection services, IServiceProvider provider, Configuration configuration)
+		{
+			var connection = provider.GetRequiredService<IConnection>();
+			var serializer = provider.GetRequiredService<ISerializer>();
+			var logger = provider.GetRequiredService<ILogger<Consumer>>();
+
+			// Keyed descriptors are skipped: they are not part of GetServices, and reading
+			// ImplementationType on a keyed descriptor throws.
+			var handlerServiceTypes = services
+				.Where(d => !d.IsKeyedService && IsClosedHandlerInterface(d.ServiceType))
+				.Select(d => d.ServiceType)
+				.Distinct();
+
+			var consumers = new List<Consumer>();
+			foreach (var serviceType in handlerServiceTypes)
+			{
+				var messageType = serviceType.GetGenericArguments()[0];
+
+				// GetServices returns every registration in order. GetRequiredService would return
+				// only the last one, so two handlers for one message type both ran the same instance.
+				foreach (var handler in provider.GetServices(serviceType))
+				{
+					var handlerType = handler!.GetType();
+					var attribute = handlerType.GetCustomAttribute<HandlerAttribute>()
+						?? throw new InvalidOperationException(
+							$"Handler '{handlerType.Name}' is registered as {serviceType.Name} but is not decorated with " +
+							$"[{nameof(HandlerAttribute)}], so DouglasMQ does not know which queue it consumes.");
+
+					consumers.Add(Consumer.Create(connection, serializer, logger, configuration, attribute, handler, messageType));
+				}
+			}
+
+			return consumers;
+		}
+
+		private static bool IsClosedHandlerInterface(Type type) =>
+			type.IsGenericType &&
+			!type.ContainsGenericParameters &&
+			type.GetGenericTypeDefinition() == typeof(IHandler<>);
 	}
 }
