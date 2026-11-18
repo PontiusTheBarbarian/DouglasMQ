@@ -1,12 +1,23 @@
+# Versioning policy
+# - Every merge to main publishes a unique prerelease: X.Y.Z-ci.N, where N counts commits since
+#   the last release tag. (ContinuousDelivery reused X.Y.Z for every merge, so the second push of
+#   the same version was rejected with 409 Conflict.)
+# - A stable release is published by pushing a tag: git tag v0.2.0 && git push origin v0.2.0.
+#   The build uses the tag as the version verbatim (build/Build.cs).
+# - Pull requests and feature branches build and test but never publish.
 mode: ContinuousDelivery
 assembly-versioning-scheme: MajorMinorPatch
 branches:
   feature:
     tag: useBranchName
     increment: Minor
-    regex: ^(?!main).*
+    # Everything except main and pull-request refs (e.g. pull/4/merge), which GitVersion's built-in
+    # pull-request config handles. If both matched, GitVersion would print a warning ahead of its
+    # JSON output and the build would fail to parse the version.
+    regex: ^(?!main$|(pull|pull\-requests|pr)[/-]).*
   main:
-    tag: ''
+    mode: ContinuousDeployment
+    tag: ci
     increment: Minor
     regex: ^main$
 ignore:

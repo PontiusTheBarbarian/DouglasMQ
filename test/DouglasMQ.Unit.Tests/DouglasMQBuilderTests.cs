@@ -55,17 +55,16 @@ namespace DouglasMQ.Unit.Tests
 		}
 
 		[Fact]
-		public async Task BuildPublisherAsync_ThrowsWhenSerializerNotSet()
+		public void Serializer_DefaultsToSystemTextJson()
 		{
-			var builder = new DouglasMQBuilder();
-			await Assert.ThrowsAsync<InvalidOperationException>(() => builder.BuildPublisherAsync());
+			Assert.IsType<SystemTextJsonSerializer>(new DouglasMQBuilder().Serializer);
 		}
 
 		[Fact]
-		public async Task StartConsumersAsync_ThrowsWhenSerializerNotSet()
+		public void WithSerializer_ReplacesDefault()
 		{
-			var builder = new DouglasMQBuilder();
-			await Assert.ThrowsAsync<InvalidOperationException>(() => builder.StartConsumersAsync());
+			var custom = new FakeSerializer();
+			Assert.Same(custom, new DouglasMQBuilder().WithSerializer(custom).Serializer);
 		}
 
 		// --- Test doubles ---

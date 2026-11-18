@@ -1,0 +1,36 @@
+root = true
+
+# Formatting only. No analyzer severities are set here: the build treats warnings as errors
+# (Directory.build.props), and code-style enforcement lives in DouglasMQ.ruleset / stylecop.json.
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = tab
+indent_size = 4
+tab_width = 4
+
+[*.{csproj,props,targets,ruleset,xml,config}]
+indent_style = tab
+indent_size = 2
+
+[*.{json,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+indent_style = space
+trim_trailing_whitespace = false
+
+[*.sh]
+end_of_line = lf
+indent_style = space
+indent_size = 2
+
+[*.cs]
+csharp_new_line_before_open_brace = all
+csharp_prefer_braces = true
+csharp_style_namespace_declarations = block_scoped
+dotnet_sort_system_directives_first = true

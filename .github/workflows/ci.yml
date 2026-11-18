@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: ["**"]
+    # Pushing a vX.Y.Z tag publishes the stable X.Y.Z release (see GitVersion.yml).
+    tags: ["v*"]
   pull_request:
     branches: ["**"]
 

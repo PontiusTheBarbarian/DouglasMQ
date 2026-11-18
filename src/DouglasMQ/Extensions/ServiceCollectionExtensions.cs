@@ -21,8 +21,9 @@ namespace DouglasMQ
 		private const string DouglasMQ = nameof(DouglasMQ);
 
 		/// <summary>
-		/// Registers DouglasMQ services using a configuration delegate. A serializer must be
-		/// registered separately before calling this method (e.g. via <see cref="AddSerializer"/>).
+		/// Registers DouglasMQ services using a configuration delegate. Uses
+		/// <see cref="SystemTextJsonSerializer"/> unless another <see cref="ISerializer"/> is registered
+		/// (e.g. via <see cref="AddSerializer"/>), before or after this call.
 		/// </summary>
 		public static IServiceCollection AddDouglasMQ(this IServiceCollection services,
 			Action<Configuration, IServiceCollection> configure)
@@ -120,6 +121,9 @@ namespace DouglasMQ
 		private static IServiceCollection AddDouglasMQ(this IServiceCollection services,
 			Configuration configuration) => services
 				.AddSingleton(configuration)
+				// Default serializer unless the app registered its own (before or after this call:
+				// AddSerializer uses AddSingleton, and the last registration wins).
+				.TryAddSingletonFluent<ISerializer, SystemTextJsonSerializer>()
 				// The consumer connection, owned and closed by the hosted Dispatcher. Resolved when the
 				// host constructs the Dispatcher.
 				.AddSingleton<IConnection>(_ =>
@@ -175,6 +179,14 @@ namespace DouglasMQ
 			}
 
 			return consumers;
+		}
+
+		private static IServiceCollection TryAddSingletonFluent<TService, TImplementation>(this IServiceCollection services)
+			where TService : class
+			where TImplementation : class, TService
+		{
+			services.TryAddSingleton<TService, TImplementation>();
+			return services;
 		}
 
 		private static bool IsClosedHandlerInterface(Type type) =>
