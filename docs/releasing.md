@@ -6,7 +6,7 @@ CI (`.github/workflows/ci.yml` running the Cake build in `build/`) does everythi
 
 | What you do | What CI builds | Tests | Published to GitHub Packages |
 |-------------|----------------|-------|------------------------------|
-| Open or update a pull request | `X.Y.Z-<branch>.N` | ✅ | ❌ |
+| Open or update a pull request | `X.Y.Z-PullRequestNNNN.N` | ✅ | ❌ |
 | Push to a feature branch | `X.Y.Z-<branch>.N` | ✅ | ❌ |
 | Merge to `main` | `X.Y.Z-ci.N` (prerelease, unique per merge) | ✅ | ✅ |
 | Push a tag `vX.Y.Z` | `X.Y.Z` (stable) | ✅ | ✅ |

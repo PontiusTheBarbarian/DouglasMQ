@@ -11,7 +11,10 @@ branches:
   feature:
     tag: useBranchName
     increment: Minor
-    regex: ^(?!main).*
+    # Everything except main and pull-request refs (e.g. pull/4/merge), which GitVersion's built-in
+    # pull-request config handles. If both matched, GitVersion would print a warning ahead of its
+    # JSON output and the build would fail to parse the version.
+    regex: ^(?!main$|(pull|pull\-requests|pr)[/-]).*
   main:
     mode: ContinuousDeployment
     tag: ci
