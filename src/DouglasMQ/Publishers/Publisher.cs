@@ -1,8 +1,11 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using DouglasMQ.Diagnostics;
 using DouglasMQ.Messages;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Logging;
@@ -122,30 +125,79 @@ namespace DouglasMQ
 		{
 			ObjectDisposedException.ThrowIf(_disposed, this);
 
-			var channel = await GetOrCreateChannelAsync();
-			var body = Encoding.UTF8.GetBytes(_serializer.Serialize<TMessage>(message));
+			var messageType = typeof(TMessage).Name;
 
-			// Persistent (delivery mode 2) so messages survive a broker restart when routed to
-			// durable queues. Identity/correlation are surfaced as standard AMQP properties so
-			// they are visible to tooling and non-DouglasMQ consumers without deserializing the body.
-			var properties = new BasicProperties
+			using var activity = DouglasMQTelemetry.ActivitySource.StartActivity($"publish {exchangeName}", ActivityKind.Producer);
+			if (activity is { IsAllDataRequested: true })
 			{
-				Persistent = true,
-				MessageId = message.MessageId.ToString(),
-				CorrelationId = message.TraceId.ToString(),
-				Type = typeof(TMessage).FullName,
-				Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+				activity.SetTag(MessagingTags.System, MessagingTags.SystemValue);
+				activity.SetTag(MessagingTags.OperationName, "publish");
+				activity.SetTag(MessagingTags.OperationType, "send");
+				activity.SetTag(MessagingTags.DestinationName, exchangeName);
+				activity.SetTag(MessagingTags.RoutingKey, routingKey);
+				activity.SetTag(MessagingTags.MessageId, message.MessageId.ToString());
+				activity.SetTag(MessagingTags.ConversationId, message.TraceId.ToString());
+				activity.SetTag(MessagingTags.MessageType, messageType);
+				activity.SetTag(MessagingTags.PublisherConfirms, _publisherConfirms);
+			}
+
+			var metricTags = new TagList
+			{
+				{ MessagingTags.System, MessagingTags.SystemValue },
+				{ MessagingTags.DestinationName, exchangeName },
+				{ MessagingTags.MessageType, messageType },
 			};
 
-			_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
-				typeof(TMessage).Name, message.MessageId, exchangeName, routingKey);
+			var startTimestamp = Stopwatch.GetTimestamp();
+			try
+			{
+				var channel = await GetOrCreateChannelAsync();
+				var body = Encoding.UTF8.GetBytes(_serializer.Serialize<TMessage>(message));
+				activity?.SetTag(MessagingTags.BodySize, body.Length);
 
-			await channel.BasicPublishAsync(
-				exchange: exchangeName,
-				routingKey: routingKey,
-				mandatory: false,
-				basicProperties: properties,
-				body: body);
+				// Trace context (traceparent/tracestate/baggage) travels in the headers so the
+				// consumer's process span joins the publisher's trace.
+				var headers = new Dictionary<string, object?>();
+				DouglasMQTelemetry.InjectContext(activity ?? Activity.Current, headers);
+
+				// Persistent (delivery mode 2) so messages survive a broker restart when routed to
+				// durable queues. Identity/correlation are surfaced as standard AMQP properties so
+				// they are visible to tooling and non-DouglasMQ consumers without deserializing the body.
+				var properties = new BasicProperties
+				{
+					Persistent = true,
+					MessageId = message.MessageId.ToString(),
+					CorrelationId = message.TraceId.ToString(),
+					Type = typeof(TMessage).FullName,
+					Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+					Headers = headers,
+				};
+
+				_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
+					messageType, message.MessageId, exchangeName, routingKey);
+
+				await channel.BasicPublishAsync(
+					exchange: exchangeName,
+					routingKey: routingKey,
+					mandatory: false,
+					basicProperties: properties,
+					body: body);
+
+				DouglasMQTelemetry.MessagesPublished.Add(1, metricTags);
+			}
+			catch (Exception ex)
+			{
+				var errorType = ex.GetType().FullName;
+				metricTags.Add(MessagingTags.ErrorType, errorType);
+				activity?.SetTag(MessagingTags.ErrorType, errorType);
+				activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+				activity?.AddException(ex);
+				throw;
+			}
+			finally
+			{
+				DouglasMQTelemetry.PublishDuration.Record(Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, metricTags);
+			}
 		}
 
 		private async ValueTask<IChannel> GetOrCreateChannelAsync()
