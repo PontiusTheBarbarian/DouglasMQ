@@ -167,6 +167,7 @@ namespace DouglasMQ
 				VirtualHost = _configuration.VirtualHost,
 				ClientProvidedName = _configuration.ClientProvidedName,
 				HostName = _configuration.HostName,
+				Port = _configuration.Port,
 				AutomaticRecoveryEnabled = true,
 				TopologyRecoveryEnabled = true,
 				RequestedHeartbeat = TimeSpan.FromSeconds(60),

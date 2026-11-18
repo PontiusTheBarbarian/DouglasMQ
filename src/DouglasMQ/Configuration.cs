@@ -1,4 +1,5 @@
 using System.Reflection;
+using RabbitMQ.Client;
 
 namespace DouglasMQ
 {
@@ -31,6 +32,12 @@ namespace DouglasMQ
 		/// RabbitMQ broker hostname. Defaults to "localhost".
 		/// </summary>
 		public string HostName { get; set; } = "localhost";
+
+		/// <summary>
+		/// RabbitMQ broker port. Defaults to -1, which uses the protocol default
+		/// (5672 for plain AMQP, 5671 when <see cref="UseSsl"/> is enabled).
+		/// </summary>
+		public int Port { get; set; } = AmqpTcpEndpoint.UseDefaultPort;
 
 		/// <summary>
 		/// Whether to enable SSL/TLS for the connection. Defaults to false.

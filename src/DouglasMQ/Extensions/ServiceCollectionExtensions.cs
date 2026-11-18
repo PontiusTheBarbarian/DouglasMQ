@@ -121,6 +121,7 @@ namespace DouglasMQ
 						c.VirtualHost = configuration.VirtualHost;
 						c.ClientProvidedName = configuration.ClientProvidedName;
 						c.HostName = configuration.HostName;
+						c.Port = configuration.Port;
 						c.UseSsl = configuration.UseSsl;
 						c.SslCertificateThumbprint = configuration.SslCertificateThumbprint;
 					});
@@ -146,7 +147,8 @@ namespace DouglasMQ
 								logger,
 								configuration,
 								service.ImplementationType!.GetCustomAttribute<HandlerAttribute>()!,
-								provider.GetRequiredService(service.ServiceType)))
+								provider.GetRequiredService(service.ServiceType),
+								service.ServiceType.GetGenericArguments()[0]))
 						.ToList();
 				})
 				.AddSingleton<IPublisher, Publisher>()

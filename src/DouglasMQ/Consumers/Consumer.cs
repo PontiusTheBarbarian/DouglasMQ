@@ -1,7 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,196 +14,260 @@ namespace DouglasMQ
 	/// Manages a single RabbitMQ consumer: declares topology, applies QoS, and dispatches
 	/// received messages to the registered handler with retry and dead-letter support.
 	/// </summary>
+	/// <remarks>
+	/// Every delivery ends in exactly one outcome: ack (handled), nack without requeue
+	/// (dead-lettered), or — only while the consumer is shutting down — left unacknowledged so
+	/// the broker redelivers it once the channel closes.
+	/// </remarks>
 	internal sealed class Consumer : IAsyncDisposable
 	{
-		private readonly ISerializer _serializer;
 		private readonly IConnection _connection;
+		private readonly ISerializer _serializer;
 		private readonly ILogger _logger;
+		private readonly HandlerAttribute _attribute;
+		private readonly HandlerInvoker _invoker;
 		private readonly int _retryCount;
 		private readonly int _retryDelayMs;
 		private readonly ushort _prefetchCount;
+
+		// Lifetime token for message processing. Deliberately separate from the StartAsync token,
+		// which only governs startup and may be short-lived or already cancelled afterwards.
+		private readonly CancellationTokenSource _stopping = new();
 		private IChannel? _channel;
 		private bool _disposed;
 
-		private string _exchangeType { get; } = null!;
-		private string _exchangeName { get; } = null!;
-		private string _queueName { get; } = null!;
-		private string _routingKey { get; } = null!;
-		private string _consumerTag { get; } = null!;
-		private bool _autoAck { get; } = false;
-		private bool _noLocal { get; } = false;
-		private bool _exclusive { get; } = false;
-		private IDictionary<string, object?>? _arguments { get; }
-		private object _concreteTypeDefinition { get; } = null!;
-
-		private Consumer(ISerializer serializer,
+		private Consumer(
 			IConnection connection,
+			ISerializer serializer,
 			ILogger logger,
 			Configuration configuration,
-			string exchangeType,
-			string exchangeName,
-			string queueName,
-			string routingKey,
-			string consumerTag,
-			object concreteTypeDefinition)
+			HandlerAttribute attribute,
+			HandlerInvoker invoker)
 		{
-			_exchangeType = exchangeType;
-			_exchangeName = exchangeName;
-			_queueName = queueName;
-			_routingKey = routingKey;
-			_consumerTag = consumerTag;
-			_serializer = serializer;
 			_connection = connection;
+			_serializer = serializer;
 			_logger = logger;
-			_retryCount = configuration.RetryCount;
-			_retryDelayMs = configuration.RetryDelayMs;
+			_attribute = attribute;
+			_invoker = invoker;
+			_retryCount = Math.Max(0, configuration.RetryCount);
+			_retryDelayMs = Math.Max(0, configuration.RetryDelayMs);
 			_prefetchCount = configuration.PrefetchCount;
-			_concreteTypeDefinition = concreteTypeDefinition;
 		}
 
 		/// <summary>
 		/// Creates a new <see cref="Consumer"/> from a <see cref="HandlerAttribute"/> and its handler instance.
 		/// </summary>
-		public static Consumer Create(IConnection connection,
+		/// <param name="connection">The connection used to open the consumer's channel.</param>
+		/// <param name="serializer">Deserializes message bodies.</param>
+		/// <param name="logger">Logger for operational events.</param>
+		/// <param name="configuration">Supplies QoS and retry settings.</param>
+		/// <param name="attribute">Topology (exchange, queue, routing key) for this consumer.</param>
+		/// <param name="handler">The handler instance that processes messages.</param>
+		/// <param name="messageType">
+		/// The message type to dispatch to. Required when the handler implements more than one
+		/// <see cref="IHandler{TMessage}"/>; inferred otherwise.
+		/// </param>
+		/// <exception cref="InvalidOperationException">The handler's message type cannot be determined.</exception>
+		public static Consumer Create(
+			IConnection connection,
 			ISerializer serializer,
 			ILogger logger,
 			Configuration configuration,
 			HandlerAttribute attribute,
-			object concreteTypeDefinition)
-			=> new Consumer(serializer,
+			object handler,
+			Type? messageType = null)
+			=> new Consumer(
 				connection,
+				serializer,
 				logger,
 				configuration,
-				attribute.ExchangeType,
-				attribute.ExchangeName,
-				attribute.QueueName,
-				attribute.RoutingKey,
-				attribute.ConsumerTag,
-				concreteTypeDefinition);
+				attribute,
+				HandlerInvoker.Create(handler, messageType));
 
 		/// <summary>
 		/// Declares topology, sets QoS, and begins consuming messages.
 		/// </summary>
+		/// <param name="cancellationToken">Cancels startup only; it does not affect message processing afterwards.</param>
 		public async Task StartAsync(CancellationToken cancellationToken)
 		{
+			ObjectDisposedException.ThrowIf(_disposed, this);
+
 			_channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken);
 			await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: _prefetchCount, global: false, cancellationToken: cancellationToken);
 			await DeclareRemoteAsync(_channel, cancellationToken);
-			await StartConsumingAsync(_channel, cancellationToken);
+
+			var channel = _channel;
+			var consumer = new AsyncEventingBasicConsumer(channel);
+			consumer.ReceivedAsync += (_, eventArgs) => HandleDeliveryAsync(channel, eventArgs);
+
+			await _channel.BasicConsumeAsync(
+				queue: _attribute.QueueName,
+				autoAck: false,
+				consumerTag: _attribute.ConsumerTag,
+				noLocal: false,
+				exclusive: false,
+				arguments: null,
+				consumer: consumer,
+				cancellationToken: cancellationToken);
 		}
 
 		private async Task DeclareRemoteAsync(IChannel channel, CancellationToken cancellationToken)
 		{
-			await channel.ExchangeDeclareAsync(_exchangeName, _exchangeType, durable: true, autoDelete: false, cancellationToken: cancellationToken);
-			await channel.QueueDeclareAsync(_queueName, durable: true, exclusive: false, autoDelete: false, arguments: new Dictionary<string, object?>()
+			await channel.ExchangeDeclareAsync(_attribute.ExchangeName, _attribute.ExchangeType, durable: true, autoDelete: false, cancellationToken: cancellationToken);
+			await channel.QueueDeclareAsync(_attribute.QueueName, durable: true, exclusive: false, autoDelete: false, arguments: new Dictionary<string, object?>()
 			{
 				{ "x-dead-letter-exchange", "dlx.exchange" },
 				{ "x-dead-letter-routing-key", "dlx_routing_key" }
 			}, cancellationToken: cancellationToken);
-			await channel.QueueBindAsync(_queueName, _exchangeName, _routingKey, cancellationToken: cancellationToken);
-		}
-
-		private async Task StartConsumingAsync(IChannel channel, CancellationToken cancellationToken)
-		{
-			var consumer = new AsyncEventingBasicConsumer(channel);
-			consumer.ReceivedAsync += BasicConsume;
-
-			await channel.BasicConsumeAsync(
-				queue: _queueName,
-				autoAck: _autoAck,
-				consumer: consumer,
-				consumerTag: _consumerTag,
-				noLocal: _noLocal,
-				exclusive: _exclusive,
-				arguments: _arguments,
-				cancellationToken: cancellationToken);
-
-			async Task BasicConsume(object sender, BasicDeliverEventArgs eventArgs)
-			{
-				const string HandleAsync = nameof(HandleAsync);
-
-				var handleMethod = _concreteTypeDefinition.GetType().GetMethod(HandleAsync);
-				if (handleMethod is null)
-				{
-					throw new InvalidOperationException($"Method '{HandleAsync}' not found on {_concreteTypeDefinition.GetType()}.");
-				}
-
-				var parameter = handleMethod.GetParameters().Single(ParameterContainsMessageAttribute);
-				var json = Encoding.UTF8.GetString(eventArgs.Body.ToArray());
-				var message = _serializer.Deserialize(json!, parameter.ParameterType);
-				if (message is null)
-				{
-					_logger.LogWarning("Received null or undeserializable message for {ParameterType}. Dead-lettering.", parameter.ParameterType);
-					await channel.BasicNackAsync(eventArgs.DeliveryTag, multiple: false, requeue: false, cancellationToken: cancellationToken);
-					return;
-				}
-
-				var lastException = default(Exception);
-				for (var attempt = 0; attempt <= _retryCount; attempt++)
-				{
-					try
-					{
-						if (attempt > 0)
-						{
-							var delayMs = _retryDelayMs * (int)Math.Pow(2, attempt - 1);
-							_logger.LogWarning("Retrying handler {Handler} for message {MessageType}, attempt {Attempt}/{RetryCount} after {DelayMs}ms.",
-								_concreteTypeDefinition.GetType().Name, parameter.ParameterType.Name, attempt, _retryCount, delayMs);
-							await Task.Delay(delayMs, cancellationToken);
-						}
-
-						await (Task)handleMethod.Invoke(_concreteTypeDefinition, new object[] { message })!;
-						await channel.BasicAckAsync(eventArgs.DeliveryTag, multiple: false, cancellationToken: cancellationToken);
-						return;
-					}
-					catch (OperationCanceledException)
-					{
-						throw;
-					}
-					catch (Exception ex)
-					{
-						lastException = ex;
-					}
-				}
-
-				_logger.LogError(lastException,
-					"Handler {Handler} failed for message {MessageType} after {Attempts} attempt(s). Dead-lettering.",
-					_concreteTypeDefinition.GetType().Name, parameter.ParameterType.Name, _retryCount + 1);
-
-				await channel.BasicNackAsync(eventArgs.DeliveryTag, multiple: false, requeue: false, cancellationToken: cancellationToken);
-			}
+			await channel.QueueBindAsync(_attribute.QueueName, _attribute.ExchangeName, _attribute.RoutingKey, cancellationToken: cancellationToken);
 		}
 
 		/// <summary>
-		/// Asynchronously disposes of the resources used by the <see cref="Consumer"/>.
+		/// Handles a single delivery. Internal (rather than private) so the ack/nack contract can be
+		/// unit tested without a broker.
 		/// </summary>
-		public async ValueTask DisposeAsync(bool disposing)
+		internal async Task HandleDeliveryAsync(IChannel channel, BasicDeliverEventArgs eventArgs)
 		{
-			if (!disposing || _disposed || _channel is null)
+			var stoppingToken = _stopping.Token;
+
+			bool handled;
+			try
 			{
+				handled = await TryHandleAsync(eventArgs, stoppingToken);
+			}
+			catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+			{
+				// Shutting down mid-processing: leave the delivery unacknowledged. The broker
+				// requeues it when the channel closes, so another consumer can pick it up.
+				_logger.LogInformation("Consumer {ConsumerTag} stopping; delivery {DeliveryTag} will be redelivered.",
+					_attribute.ConsumerTag, eventArgs.DeliveryTag);
 				return;
 			}
 
 			try
 			{
-				await _channel.CloseAsync();
+				// CancellationToken.None: an ack/nack must not be skipped because of cancellation,
+				// otherwise the message is stuck unacknowledged and holds a prefetch slot.
+				if (handled)
+				{
+					await channel.BasicAckAsync(eventArgs.DeliveryTag, multiple: false, CancellationToken.None);
+				}
+				else
+				{
+					await channel.BasicNackAsync(eventArgs.DeliveryTag, multiple: false, requeue: false, CancellationToken.None);
+				}
 			}
-			finally
+			catch (Exception ex) when (!channel.IsOpen)
 			{
-				await _channel.DisposeAsync();
-				_disposed = true;
+				// Channel went away between handling and settling. Nothing else can be done here;
+				// the broker will redeliver the message.
+				_logger.LogWarning(ex, "Could not settle delivery {DeliveryTag} on {ConsumerTag}: channel is closed. It will be redelivered.",
+					eventArgs.DeliveryTag, _attribute.ConsumerTag);
 			}
+		}
+
+		/// <returns><c>true</c> to ack; <c>false</c> to dead-letter.</returns>
+		private async Task<bool> TryHandleAsync(BasicDeliverEventArgs eventArgs, CancellationToken stoppingToken)
+		{
+			object? message;
+			try
+			{
+				var payload = Encoding.UTF8.GetString(eventArgs.Body.Span);
+				message = _serializer.Deserialize(payload, _invoker.MessageType);
+			}
+			catch (Exception ex)
+			{
+				// Poison message: retrying cannot help, so dead-letter immediately.
+				_logger.LogError(ex, "Failed to deserialize message for {MessageType} on {ConsumerTag}. Dead-lettering.",
+					_invoker.MessageType.Name, _attribute.ConsumerTag);
+				return false;
+			}
+
+			if (message is null)
+			{
+				_logger.LogWarning("Received null message for {MessageType} on {ConsumerTag}. Dead-lettering.",
+					_invoker.MessageType.Name, _attribute.ConsumerTag);
+				return false;
+			}
+
+			var lastException = default(Exception);
+			for (var attempt = 0; attempt <= _retryCount; attempt++)
+			{
+				if (attempt > 0)
+				{
+					var delay = GetRetryDelay(attempt);
+					_logger.LogWarning("Retrying handler {Handler} for message {MessageType}, attempt {Attempt}/{RetryCount} after {DelayMs}ms.",
+						_invoker.HandlerName, _invoker.MessageType.Name, attempt, _retryCount, delay.TotalMilliseconds);
+
+					// Throws OperationCanceledException on shutdown, handled by the caller.
+					await Task.Delay(delay, stoppingToken);
+				}
+
+				try
+				{
+					await _invoker.InvokeAsync(message);
+					return true;
+				}
+				catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+				{
+					throw;
+				}
+				catch (Exception ex)
+				{
+					// Includes OperationCanceledException raised by the handler itself (e.g. an
+					// HttpClient timeout), which is a handler failure, not a consumer shutdown.
+					lastException = ex;
+				}
+			}
+
+			_logger.LogError(lastException,
+				"Handler {Handler} failed for message {MessageType} after {Attempts} attempt(s). Dead-lettering.",
+				_invoker.HandlerName, _invoker.MessageType.Name, _retryCount + 1);
+			return false;
 		}
 
 		/// <summary>
-		/// Disposes of the <see cref="Consumer"/> and suppresses finalization.
+		/// Exponential backoff: base delay × 2^(attempt-1), capped so large retry counts cannot
+		/// overflow or produce an invalid <see cref="Task.Delay(TimeSpan)"/> argument.
+		/// </summary>
+		internal TimeSpan GetRetryDelay(int attempt)
+		{
+			var delayMs = _retryDelayMs * Math.Pow(2, attempt - 1);
+			return TimeSpan.FromMilliseconds(Math.Min(delayMs, MaxRetryDelay.TotalMilliseconds));
+		}
+
+		private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(5);
+
+		/// <summary>
+		/// Stops message processing and closes the consumer's channel.
 		/// </summary>
 		public async ValueTask DisposeAsync()
 		{
-			await DisposeAsync(true);
-			GC.SuppressFinalize(this);
-		}
+			if (_disposed)
+			{
+				return;
+			}
 
-		private readonly Func<ParameterInfo, bool> ParameterContainsMessageAttribute = p =>
-			p.ParameterType.GetCustomAttributes(typeof(MessageAttribute), true).Any();
+			_disposed = true;
+			await _stopping.CancelAsync();
+
+			var channel = _channel;
+			if (channel is not null)
+			{
+				try
+				{
+					if (channel.IsOpen)
+					{
+						await channel.CloseAsync();
+					}
+				}
+				finally
+				{
+					await channel.DisposeAsync();
+				}
+			}
+
+			_stopping.Dispose();
+		}
 	}
 }
