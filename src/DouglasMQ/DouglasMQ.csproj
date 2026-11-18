@@ -13,8 +13,8 @@
 		<Description>A strongly-typed RabbitMQ wrapper for .NET with built-in retry, dead-lettering, QoS, and Microsoft DI support. Usable with or without a dependency injection container.</Description>
 		<PackageTags>rabbitmq;amqp;messaging;dotnet;microservices;pubsub</PackageTags>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageProjectUrl>https://github.com/yourusername/DouglasMQ</PackageProjectUrl>
-		<RepositoryUrl>https://github.com/yourusername/DouglasMQ</RepositoryUrl>
+		<PackageProjectUrl>https://github.com/PontiusTheBarbarian/DouglasMQ</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/PontiusTheBarbarian/DouglasMQ</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 
@@ -32,7 +32,8 @@
 
 	<ItemGroup>
 		<PackageReference Include="RabbitMQ.Client" />
-		<PackageReference Include="Microsoft.Extensions.Hosting" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 	</ItemGroup>
 

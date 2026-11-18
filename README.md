@@ -41,7 +41,6 @@ public class OrderPlacedHandler : IHandler<OrderPlaced>
 ```csharp
 var (publisher, consumers) = await new DouglasMQBuilder()
     .Configure(c => c.HostName = "localhost")
-    .WithSerializer(new MySerializer())
     .AddHandler(new OrderPlacedHandler())
     .BuildAsync();
 
@@ -77,3 +76,9 @@ await ((IAsyncDisposable)publisher).DisposeAsync();
 - [RabbitMQ AMQP best practices](https://stackoverflow.com/questions/32220312/rabbitmq-amqp-best-practice-queue-topic-design-in-a-microservice-architecture)
 - [RabbitMQ concepts and best practices](https://medium.com/cwan-engineering/rabbitmq-concepts-and-best-practices-aa3c699d6f08)
 - [RabbitMQ Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)
+
+---
+
+## License
+
+[MIT](LICENSE)

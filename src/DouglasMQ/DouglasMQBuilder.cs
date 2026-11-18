@@ -19,8 +19,8 @@ namespace DouglasMQ
 	/// <code>
 	/// var builder = new DouglasMQBuilder()
 	///     .Configure(c => c.HostName = "localhost")
-	///     .WithSerializer(new MySerializer())
-	///     .AddHandler(new ManHandler());
+	///     .WithSerializer(new SystemTextJsonSerializer()) // optional: this is the default
+	///     .AddHandler(new OrderPlacedHandler());
 	///
 	/// await using var publisher = await builder.BuildPublisherAsync();
 	/// await publisher.PublishAsync(new MyEvent());
@@ -29,7 +29,7 @@ namespace DouglasMQ
 	public sealed class DouglasMQBuilder
 	{
 		private Configuration _configuration = new Configuration();
-		private ISerializer? _serializer;
+		private ISerializer _serializer = new SystemTextJsonSerializer();
 		private ILoggerFactory _loggerFactory = NullLoggerFactory.Instance;
 		private readonly List<(HandlerAttribute Attribute, object Handler)> _handlers = new();
 
@@ -42,8 +42,12 @@ namespace DouglasMQ
 			return this;
 		}
 
+		/// <summary>The serializer that will be used for message bodies.</summary>
+		internal ISerializer Serializer => _serializer;
+
 		/// <summary>
-		/// Provides the serializer used to encode and decode message bodies.
+		/// Replaces the serializer used to encode and decode message bodies. Defaults to
+		/// <see cref="SystemTextJsonSerializer"/>.
 		/// </summary>
 		public DouglasMQBuilder WithSerializer(ISerializer serializer)
 		{
@@ -107,9 +111,8 @@ namespace DouglasMQ
 		/// </summary>
 		public async Task<IPublisher> BuildPublisherAsync(CancellationToken cancellationToken = default)
 		{
-			EnsureSerializer();
 			var connection = await ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, ConnectionFactoryBuilder.PublisherSuffix, cancellationToken);
-			return new Publisher(connection, ownsConnection: true, _serializer!, _loggerFactory.CreateLogger<Publisher>(), _configuration);
+			return new Publisher(connection, ownsConnection: true, _serializer, _loggerFactory.CreateLogger<Publisher>(), _configuration);
 		}
 
 		/// <summary>
@@ -119,7 +122,6 @@ namespace DouglasMQ
 		/// </summary>
 		public async Task<IAsyncDisposable> StartConsumersAsync(CancellationToken cancellationToken = default)
 		{
-			EnsureSerializer();
 			var connection = await ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, ConnectionFactoryBuilder.ConsumerSuffix, cancellationToken);
 
 			Dispatcher? dispatcher = null;
@@ -157,7 +159,6 @@ namespace DouglasMQ
 		/// </summary>
 		public async Task<(IPublisher Publisher, IAsyncDisposable Consumers)> BuildAsync(CancellationToken cancellationToken = default)
 		{
-			EnsureSerializer();
 			var publisher = await BuildPublisherAsync(cancellationToken);
 			try
 			{
@@ -180,25 +181,15 @@ namespace DouglasMQ
 
 		private List<Consumer> BuildConsumers(IConnection connection)
 		{
-			EnsureSerializer();
 			return _handlers
 				.Select(h => Consumer.Create(
 					connection,
-					_serializer!,
+					_serializer,
 					_loggerFactory.CreateLogger<Consumer>(),
 					_configuration,
 					h.Attribute,
 					h.Handler))
 				.ToList();
-		}
-
-		private void EnsureSerializer()
-		{
-			if (_serializer is null)
-			{
-				throw new InvalidOperationException(
-					"A serializer must be provided via WithSerializer() before building.");
-			}
 		}
 	}
 }

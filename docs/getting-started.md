@@ -64,7 +64,6 @@ var (publisher, consumers) = await new DouglasMQBuilder()
         c.Username = "guest";
         c.Password = "guest";
     })
-    .WithSerializer(new MySerializer())
     .AddHandler(new OrderPlacedHandler())
     .BuildAsync();
 
@@ -82,25 +81,22 @@ Console.CancelKeyPress += async (_, _) =>
 ### With Microsoft DI (ASP.NET Core, Worker Service)
 
 ```csharp
-builder.Services.AddDouglasMQ(builder.Configuration, typeof(Program), typeof(MySerializer));
+builder.Services.AddDouglasMQ(builder.Configuration, typeof(Program), typeof(SystemTextJsonSerializer));
 ```
 
 See [di-integration.md](di-integration.md) for the full setup.
 
-## Step 4 — Implement a serializer
+## Step 4 — (Optional) Choose a serializer
 
-DouglasMQ does not bundle a serializer so you can use any JSON/binary library:
+Message bodies are serialized with the built-in `SystemTextJsonSerializer`, which writes camelCase JSON and reads property names case-insensitively. You don't need to do anything to use it.
+
+To customise it, pass your own `JsonSerializerOptions`:
 
 ```csharp
-using System.Text.Json;
-using DouglasMQ.Serialization;
-
-public class SystemTextJsonSerializer : ISerializer
-{
-    public string Serialize<T>(T data) => JsonSerializer.Serialize(data);
-    public object? Deserialize(string data, Type type) => JsonSerializer.Deserialize(data, type);
-}
+.WithSerializer(new SystemTextJsonSerializer(new JsonSerializerOptions { /* converters, policies */ }))
 ```
+
+To use another library (Newtonsoft.Json, MessagePack, …), implement `DouglasMQ.Serialization.ISerializer` and register it with `WithSerializer(...)`, or with `AddSerializer(typeof(MySerializer))` in DI.
 
 ## Next Steps
 
