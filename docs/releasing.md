@@ -1,21 +1,33 @@
-# Releasing to NuGet
+# Releasing
 
-## Pre-release checklist
+## How releases work
 
-Before publishing a new version, verify:
+CI (`.github/workflows/ci.yml` running the Cake build in `build/`) does everything. Nobody edits a version number by hand.
 
-- [ ] `<Version>` in `src/DouglasMQ/DouglasMQ.csproj` is bumped (see versioning below)
-- [ ] `CHANGELOG.md` entry written for this version
-- [ ] `dotnet build -c Release` — zero warnings, zero errors
-- [ ] `dotnet test test/DouglasMQ.Unit.Tests` — all unit tests pass (no Docker required)
-- [ ] `dotnet test test/DouglasMQ.Architecture.Tests` — all architecture rules pass
-- [ ] `dotnet test test/DouglasMQ.Integration.Tests` — all integration tests pass (Docker required)
-- [ ] `dotnet pack src/DouglasMQ -c Release` — `.nupkg` and `.snupkg` produced without errors
-- [ ] Inspect the package contents (see below)
+| What you do | What CI builds | Tests | Published to GitHub Packages |
+|-------------|----------------|-------|------------------------------|
+| Open or update a pull request | `X.Y.Z-<branch>.N` | ✅ | ❌ |
+| Push to a feature branch | `X.Y.Z-<branch>.N` | ✅ | ❌ |
+| Merge to `main` | `X.Y.Z-ci.N` (prerelease, unique per merge) | ✅ | ✅ |
+| Push a tag `vX.Y.Z` | `X.Y.Z` (stable) | ✅ | ✅ |
 
----
+Versions come from [GitVersion](https://gitversion.net/) (`GitVersion.yml`). `X.Y.Z` is the last release tag with the minor version bumped. `N` counts commits since that tag. The same version is stamped on the assemblies (`AssemblyVersion`, `FileVersion`, `InformationalVersion`) and on the package.
 
-## Versioning
+### Cutting a stable release
+
+1. Make sure `main` is green and `CHANGELOG.md` describes the release.
+2. Tag the commit and push the tag:
+
+   ```bash
+   git tag v0.3.0
+   git push origin v0.3.0
+   ```
+
+3. CI builds, tests and publishes `0.3.0`. The tag is used verbatim as the version, so `v1.0.0-rc.1` publishes `1.0.0-rc.1`.
+
+A version can only be pushed to the feed once, so never re-tag a released version. Fix forward with the next version instead.
+
+### Choosing the next version
 
 DouglasMQ uses [Semantic Versioning](https://semver.org/):
 
@@ -25,39 +37,16 @@ DouglasMQ uses [Semantic Versioning](https://semver.org/):
 | New feature, backwards compatible | Minor | `1.2.3` → `1.3.0` |
 | Breaking change | Major | `1.2.3` → `2.0.0` |
 
-Set the version in `src/DouglasMQ/DouglasMQ.csproj`:
+Before 1.0, breaking changes bump the minor version.
 
-```xml
-<Version>1.0.0</Version>
-<AssemblyVersion>1.0.0</AssemblyVersion>
-<FileVersion>1.0.0</FileVersion>
-```
+## Pre-release checklist (local)
 
-### GitVersion (optional)
+CI runs all of this, but to check before tagging:
 
-For automatic version management from git history and tags, add [GitVersion](https://gitversion.net/):
-
-```bash
-dotnet tool install --global GitVersion.Tool
-```
-
-`GitVersion.yml` at the repo root:
-```yaml
-mode: ContinuousDelivery
-branches:
-  main:
-    tag: ''
-    increment: Patch
-  feature:
-    tag: alpha
-    increment: Minor
-```
-
-Then in CI:
-```yaml
-- name: Set version
-  run: dotnet-gitversion /updateprojectfiles
-```
+- [ ] `dotnet build -c Release`: zero warnings, zero errors
+- [ ] `dotnet test`: unit, architecture and integration tests pass (integration tests need Docker)
+- [ ] `dotnet pack src/DouglasMQ -c Release`: `.nupkg` and `.snupkg` produced
+- [ ] Inspect the package contents (see below)
 
 ---
 
@@ -160,60 +149,7 @@ Push the `.snupkg` separately — NuGet.org processes it independently and assoc
 
 ### GitHub Actions CI/CD
 
-```yaml
-name: Publish NuGet
-
-on:
-  push:
-    tags:
-      - 'v*'
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # Required for Source Link and GitVersion
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.x'
-
-      - name: Build
-        run: dotnet build -c Release --no-incremental
-
-      - name: Test (unit)
-        run: dotnet test test/DouglasMQ.Unit.Tests -c Release --no-build
-
-      - name: Test (architecture)
-        run: dotnet test test/DouglasMQ.Architecture.Tests -c Release --no-build
-
-      - name: Pack
-        run: dotnet pack src/DouglasMQ -c Release --no-build -o ./artifacts
-
-      - name: Push to NuGet
-        run: |
-          dotnet nuget push artifacts/*.nupkg \
-            --api-key ${{ secrets.NUGET_API_KEY }} \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate
-          dotnet nuget push artifacts/*.snupkg \
-            --api-key ${{ secrets.NUGET_API_KEY }} \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate
-```
-
-Store your NuGet API key in GitHub → Repository Settings → Secrets → `NUGET_API_KEY`.
-
-The workflow triggers on version tags (`v1.0.0`, `v1.2.3`). Tag a release:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
----
+Publishing is automated by the existing workflow (see [How releases work](#how-releases-work)). The `PublishTask` in `build/Build.cs` pushes only for `main` and `v*` tags.
 
 ## Private feed (Azure Artifacts / GitHub Packages)
 

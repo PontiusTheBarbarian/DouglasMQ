@@ -1,3 +1,10 @@
+# Versioning policy
+# - Every merge to main publishes a unique prerelease: X.Y.Z-ci.N, where N counts commits since
+#   the last release tag. (ContinuousDelivery reused X.Y.Z for every merge, so the second push of
+#   the same version was rejected with 409 Conflict.)
+# - A stable release is published by pushing a tag: git tag v0.2.0 && git push origin v0.2.0.
+#   The build uses the tag as the version verbatim (build/Build.cs).
+# - Pull requests and feature branches build and test but never publish.
 mode: ContinuousDelivery
 assembly-versioning-scheme: MajorMinorPatch
 branches:
@@ -6,7 +13,8 @@ branches:
     increment: Minor
     regex: ^(?!main).*
   main:
-    tag: ''
+    mode: ContinuousDeployment
+    tag: ci
     increment: Minor
     regex: ^main$
 ignore:

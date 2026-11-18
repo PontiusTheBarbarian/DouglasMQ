@@ -1,4 +1,5 @@
-﻿using System;
+#nullable enable
+using System;
 using Build;
 using Build.Extensions;
 using Cake.Common;
@@ -9,6 +10,7 @@ using Cake.Common.Tools.DotNet;
 using Cake.Common.Tools.DotNet.Build;
 using Cake.Common.Tools.DotNet.Clean;
 using Cake.Common.Tools.DotNet.Pack;
+using Cake.Common.Tools.DotNet.Test;
 using Cake.Common.Tools.GitVersion;
 using Cake.Core;
 using Cake.Frosting;
@@ -38,15 +40,33 @@ public sealed class VersionTask : FrostingTask<BuildContext>
 		var versionInfo = context.GitVersion(new()
 		{
 			ConfigFile = BuildConstants.GitVersionFilePath,
-			OutputType = context.IsRunningOnBuildServer
-				? GitVersionOutput.BuildServer
-				: GitVersionOutput.Json,
+			// Json, not BuildServer: with BuildServer output Cake returns an empty result object.
+			OutputType = GitVersionOutput.Json,
 			Verbosity = GitVersionVerbosity.Verbose,
+			// Versions are passed to build/pack as MSBuild properties instead (see BuildVersion),
+			// so project files are never rewritten and one value flows to both DLL and package.
+			UpdateProjectFiles = false,
 			Diag = true
 		});
 
 		context.WriteVersioningReportToOutputDirectory(versionInfo,
 			CreateReportFilePath(context, BuildConstants.GitVersionJsonFile));
+
+		if (string.IsNullOrWhiteSpace(versionInfo.SemVer))
+		{
+			throw new InvalidOperationException("GitVersion did not return a version.");
+		}
+
+		context.Version = context.ReleaseTagVersion is { } tagVersion
+			// Tag build: the tag is the release version, exactly. GitVersion would apply the
+			// branch label because the tag ref does not match the 'main' branch config.
+			? new BuildVersion(
+				tagVersion,
+				$"{tagVersion.Split('-', '+')[0]}.0",
+				$"{tagVersion}+Sha.{versionInfo.Sha}")
+			: new BuildVersion(versionInfo.SemVer, versionInfo.AssemblySemVer, versionInfo.InformationalVersion);
+
+		context.Information($"Version: {context.Version.PackageVersion} (ref '{context.GitRef}', publish: {context.ShouldPublish}).");
 	}
 
 	// Reports are uploaded by the 'Upload reports' step in the GitHub Actions workflow.
@@ -110,56 +130,84 @@ public sealed class BuildTask : FrostingTask<BuildContext>
 		context.Information("Build starting.");
 		context.DotNetBuild(context.SolutionFile, new DotNetBuildSettings
 		{
-			Configuration = context.BuildConfiguration
+			Configuration = context.BuildConfiguration,
+			NoRestore = true,
+			// Stamp the GitVersion version on the assemblies themselves. Pack runs with --no-build,
+			// so passing the version only at pack time would leave the DLLs at the SDK default.
+			ArgumentCustomization = args => context.Version is null ? args : args.Append(context.Version.ToMSBuildArguments())
 		});
 		context.Information("Build finished.");
 	}
 }
 
-[TaskName(nameof(PackTask))]
+[TaskName(nameof(TestTask))]
 [IsDependentOn(typeof(BuildTask))]
+public sealed class TestTask : FrostingTask<BuildContext>
+{
+	public override void Run(BuildContext context)
+	{
+		// Runs unit, architecture and integration tests. Integration tests start RabbitMQ with
+		// Testcontainers, so the runner needs Docker (GitHub's ubuntu runners have it).
+		context.Information("Tests starting.");
+		context.DotNetTest(context.SolutionFile, new DotNetTestSettings
+		{
+			Configuration = context.BuildConfiguration,
+			NoRestore = true,
+			NoBuild = true,
+			ResultsDirectory = $"{context.ReportsDirectory}/tests",
+			Loggers = new[] { "trx" },
+		});
+		context.Information("Tests finished.");
+	}
+}
+
+[TaskName(nameof(PackTask))]
+[IsDependentOn(typeof(TestTask))]
 public sealed class PackTask : FrostingTask<BuildContext>
 {
 	public override void Run(BuildContext context)
 	{
 		context.Information("Pack starting.");
-		const string version = "Version";
 		context.DotNetPack(context.SolutionFile, new DotNetPackSettings
 		{
 			Configuration = context.BuildConfiguration,
 			NoRestore = true,
 			NoBuild = true,
 			OutputDirectory = $"{context.ArtifactDirectory}/NuGet",
-			ArgumentCustomization = args
-				=> args.Append(CreateArgument(version, context.GitVersion().SemVer))
+			ArgumentCustomization = args => context.Version is null ? args : args.Append(context.Version.ToMSBuildArguments())
 		});
 		context.Information("Pack finished.");
+	}
+}
 
-		context.Information("NuGet push started.");
-		const string glob = "*.nupkg";
-		context.DotNetNuGetPush(CreatePathToPackages($"{context.ArtifactDirectory}/NuGet", glob), new()
+[TaskName(nameof(PublishTask))]
+[IsDependentOn(typeof(PackTask))]
+public sealed class PublishTask : FrostingTask<BuildContext>
+{
+	public override bool ShouldRun(BuildContext context)
+	{
+		if (!context.ShouldPublish)
+		{
+			context.Information($"Skipping NuGet push for ref '{context.GitRef}': only main and v* tags publish.");
+		}
+
+		return context.ShouldPublish;
+	}
+
+	public override void Run(BuildContext context)
+	{
+		context.Information($"NuGet push of {context.Version?.PackageVersion} started.");
+		context.DotNetNuGetPush($"{context.ArtifactDirectory}/NuGet/*.nupkg", new()
 		{
 			Source = BuildConstants.NuGetFeedUrl,
 			ApiKey = context.EnvironmentVariable(BuildConstants.NUGET_ACCESS_TOKEN)
 		});
 		context.Information("NuGet push finished.");
 	}
-
-	private static string CreateArgument(string name, string value)
-	{
-		const string template = "/p:{0}={1}";
-		return string.Format(template, name, value);
-	}
-
-	private static string CreatePathToPackages(string directory, string glob)
-	{
-		const string template = "{0}/{1}";
-		return string.Format(template, directory, glob);
-	}
 }
 
 [TaskName(nameof(UploadArtifactsTask))]
-[IsDependentOn(typeof(PackTask))]
+[IsDependentOn(typeof(PublishTask))]
 public sealed class UploadArtifactsTask : FrostingTask<BuildContext>
 {
 	public override bool ShouldRun(BuildContext context) 

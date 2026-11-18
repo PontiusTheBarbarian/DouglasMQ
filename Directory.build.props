@@ -3,11 +3,10 @@
 		<Authors>Liam Appleyard</Authors>
 		<Company>Goodboy</Company>
 		<IsPackable>false</IsPackable>
-		<Version>0.0.1</Version>
-		<AssemblyInformationalVersion>0.0.1</AssemblyInformationalVersion>
-		<AssemblyFileVersion>0.0.1</AssemblyFileVersion>
-		<AssemblyVersion>0.0.1</AssemblyVersion>
-		<Copyright>Copyright Goodboy © 2022</Copyright>
+		<Copyright>Copyright © 2022-2026 Goodboy</Copyright>
+		<!-- Versions are supplied by GitVersion in CI (see build/Build.cs). Local builds use the SDK default. -->
+		<!-- GitVersion's InformationalVersion already includes the commit SHA. -->
+		<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 		<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
 
 		<!-- Use the latest C# language features across all projects -->
