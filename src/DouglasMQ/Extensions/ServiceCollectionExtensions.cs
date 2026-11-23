@@ -71,14 +71,23 @@ namespace DouglasMQ
 		/// <summary>
 		/// Scans the assembly containing <paramref name="assemblyMark"/> for all types that
 		/// implement <see cref="IHandler{TMessage}"/> and are decorated with <see cref="HandlerAttribute"/>,
-		/// then registers each as a singleton.
+		/// then registers each with <paramref name="lifetime"/>.
 		/// </summary>
+		/// <param name="services">The service collection.</param>
+		/// <param name="assemblyMark">A type in the assembly to scan.</param>
+		/// <param name="lifetime">
+		/// The handlers' lifetime. With <see cref="ServiceLifetime.Scoped"/> (the default) or
+		/// <see cref="ServiceLifetime.Transient"/>, each message is handled by a new handler instance
+		/// created in its own scope, so handlers can depend on scoped services such as a <c>DbContext</c>.
+		/// With <see cref="ServiceLifetime.Singleton"/>, one instance handles every message.
+		/// </param>
 		/// <exception cref="InvalidOperationException">
 		/// A decorated handler implements more than one <see cref="IHandler{TMessage}"/>. A handler
 		/// class maps to a single queue, so each message type needs its own handler class (or an
 		/// explicit <see cref="AddConsumer{TMessage, TImp}"/> registration).
 		/// </exception>
-		public static IServiceCollection AutoRegisterConsumers(this IServiceCollection services, Type assemblyMark)
+		public static IServiceCollection AutoRegisterConsumers(this IServiceCollection services, Type assemblyMark,
+			ServiceLifetime lifetime = ServiceLifetime.Scoped)
 		{
 			ArgumentNullException.ThrowIfNull(assemblyMark);
 
@@ -95,7 +104,7 @@ namespace DouglasMQ
 
 				// TryAddEnumerable: re-scanning, or scanning plus AddConsumer, must not register the
 				// same handler twice (which would start two consumers for it).
-				services.TryAddEnumerable(ServiceDescriptor.Singleton(typeof(IHandler<>).MakeGenericType(messageTypes[0]), handlerType));
+				services.TryAddEnumerable(ServiceDescriptor.Describe(typeof(IHandler<>).MakeGenericType(messageTypes[0]), handlerType, lifetime));
 			}
 
 			return services;
@@ -104,11 +113,19 @@ namespace DouglasMQ
 		/// <summary>
 		/// Manually registers a single handler.
 		/// </summary>
-		public static IServiceCollection AddConsumer<TMessage, TImp>(this IServiceCollection services)
+		/// <param name="services">The service collection.</param>
+		/// <param name="lifetime">
+		/// The handler's lifetime. With <see cref="ServiceLifetime.Scoped"/> (the default) or
+		/// <see cref="ServiceLifetime.Transient"/>, each message is handled by a new handler instance
+		/// created in its own scope. With <see cref="ServiceLifetime.Singleton"/>, one instance handles
+		/// every message.
+		/// </param>
+		public static IServiceCollection AddConsumer<TMessage, TImp>(this IServiceCollection services,
+			ServiceLifetime lifetime = ServiceLifetime.Scoped)
 			where TMessage : class, IMessage
 			where TImp : class, IHandler<TMessage>
 		{
-			services.TryAddEnumerable(ServiceDescriptor.Singleton<IHandler<TMessage>, TImp>());
+			services.TryAddEnumerable(ServiceDescriptor.Describe(typeof(IHandler<TMessage>), typeof(TImp), lifetime));
 			return services;
 		}
 
@@ -146,39 +163,120 @@ namespace DouglasMQ
 		/// Builds one consumer per registered <see cref="IHandler{TMessage}"/> — including factory and
 		/// instance registrations, and several handlers for the same message type.
 		/// </summary>
+		/// <remarks>
+		/// Singleton handlers are resolved once and reused for every message. Scoped and transient
+		/// handlers get a new dependency injection scope per handling attempt (so a retry never reuses
+		/// a scoped service, such as a <c>DbContext</c>, left in a bad state by the failed attempt), and
+		/// a new handler instance created in it. Each one is also created once here, so a handler that
+		/// cannot be constructed fails at startup rather than on its first message.
+		/// </remarks>
 		private static List<Consumer> CreateConsumers(IServiceCollection services, IServiceProvider provider, Configuration configuration)
 		{
 			var connection = provider.GetRequiredService<IConnection>();
 			var serializer = provider.GetRequiredService<ISerializer>();
 			var logger = provider.GetRequiredService<ILogger<Consumer>>();
+			var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
 
 			// Keyed descriptors are skipped: they are not part of GetServices, and reading
 			// ImplementationType on a keyed descriptor throws.
-			var handlerServiceTypes = services
+			var handlerDescriptors = services
 				.Where(d => !d.IsKeyedService && IsClosedHandlerInterface(d.ServiceType))
-				.Select(d => d.ServiceType)
-				.Distinct();
+				.GroupBy(d => d.ServiceType);
 
 			var consumers = new List<Consumer>();
-			foreach (var serviceType in handlerServiceTypes)
+			foreach (var group in handlerDescriptors)
 			{
+				var serviceType = group.Key;
 				var messageType = serviceType.GetGenericArguments()[0];
+				var descriptors = group.ToList();
 
-				// GetServices returns every registration in order. GetRequiredService would return
-				// only the last one, so two handlers for one message type both ran the same instance.
-				foreach (var handler in provider.GetServices(serviceType))
+				// A scope for resolving singletons (a singleton resolved from the root provider would
+				// bypass scope validation) and for trying out the other handlers once at startup.
+				var startupScope = scopeFactory.CreateAsyncScope();
+				try
 				{
-					var handlerType = handler!.GetType();
-					var attribute = handlerType.GetCustomAttribute<HandlerAttribute>()
-						?? throw new InvalidOperationException(
-							$"Handler '{handlerType.Name}' is registered as {serviceType.Name} but is not decorated with " +
-							$"[{nameof(HandlerAttribute)}], so DouglasMQ does not know which queue it consumes.");
+					var singletons = descriptors.Any(d => d.Lifetime == ServiceLifetime.Singleton)
+						? GetHandlerRegistrations(startupScope.ServiceProvider, serviceType, descriptors.Count)
+						: null;
 
-					consumers.Add(Consumer.Create(connection, serializer, logger, configuration, attribute, handler, messageType));
+					for (var i = 0; i < descriptors.Count; i++)
+					{
+						HandlerInvoker invoker;
+						if (descriptors[i].Lifetime == ServiceLifetime.Singleton)
+						{
+							invoker = HandlerInvoker.Create(singletons![i]!, messageType);
+						}
+						else
+						{
+							var activate = CreateActivator(descriptors[i]);
+							var handlerType = GetHandlerTypeByActivating(activate, startupScope.ServiceProvider);
+							invoker = HandlerInvoker.CreateScoped(scopeFactory, handlerType, messageType, activate);
+						}
+
+						consumers.Add(Consumer.Create(connection, serializer, logger, configuration, GetHandlerAttribute(serviceType, invoker), invoker));
+					}
+				}
+				finally
+				{
+					// Runs once at startup, from a synchronous factory.
+					startupScope.DisposeAsync().AsTask().GetAwaiter().GetResult();
 				}
 			}
 
 			return consumers;
+		}
+
+		/// <summary>
+		/// Resolves every registration of <paramref name="serviceType"/>, in registration order, so they
+		/// line up with the descriptors.
+		/// </summary>
+		private static List<object?> GetHandlerRegistrations(IServiceProvider provider, Type serviceType, int expectedCount)
+		{
+			// GetServices returns every registration in order. GetRequiredService would return
+			// only the last one, so two handlers for one message type both ran the same instance.
+			var handlers = provider.GetServices(serviceType).ToList();
+			if (handlers.Count != expectedCount)
+			{
+				throw new InvalidOperationException(
+					$"Expected {expectedCount} registration(s) of {serviceType.Name} but the container returned {handlers.Count}. " +
+					$"Open generic {nameof(IHandler<IMessage>)}<> registrations are not supported; register each handler for its message type.");
+			}
+
+			return handlers;
+		}
+
+		/// <summary>
+		/// Creates a scoped or transient handler from a scope's provider, the way the container would
+		/// for that one registration (resolving every registration would also create its siblings).
+		/// </summary>
+		private static Func<IServiceProvider, object> CreateActivator(ServiceDescriptor descriptor)
+		{
+			if (descriptor.ImplementationFactory is { } factory)
+			{
+				return factory;
+			}
+
+			var implementationType = descriptor.ImplementationType!;
+			var create = ActivatorUtilities.CreateFactory(implementationType, Type.EmptyTypes);
+			return provider => create(provider, null);
+		}
+
+		private static Type GetHandlerTypeByActivating(Func<IServiceProvider, object> activate, IServiceProvider provider)
+		{
+			var handler = activate(provider);
+			var handlerType = handler.GetType();
+
+			HandlerInvoker.DisposeHandlerAsync(handler).AsTask().GetAwaiter().GetResult();
+
+			return handlerType;
+		}
+
+		private static HandlerAttribute GetHandlerAttribute(Type serviceType, HandlerInvoker invoker)
+		{
+			return invoker.HandlerType.GetCustomAttribute<HandlerAttribute>()
+				?? throw new InvalidOperationException(
+					$"Handler '{invoker.HandlerName}' is registered as {serviceType.Name} but is not decorated with " +
+					$"[{nameof(HandlerAttribute)}], so DouglasMQ does not know which queue it consumes.");
 		}
 
 		private static IServiceCollection TryAddSingletonFluent<TService, TImplementation>(this IServiceCollection services)
