@@ -9,7 +9,7 @@
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 
 		<!-- NuGet package identity -->
-		<PackageId>DouglasMQ</PackageId>
+		<PackageId>PontiusTheBarbarian.DouglasMQ</PackageId>
 		<Description>A strongly-typed RabbitMQ wrapper for .NET with built-in retry, dead-lettering, QoS, and Microsoft DI support. Usable with or without a dependency injection container.</Description>
 		<PackageTags>rabbitmq;amqp;messaging;dotnet;microservices;pubsub</PackageTags>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>

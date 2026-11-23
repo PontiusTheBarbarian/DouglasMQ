@@ -7,7 +7,7 @@ DouglasMQ integrates with `Microsoft.Extensions.DependencyInjection` via extensi
 ### Auto-register handlers from an assembly
 
 ```csharp
-// Scans the assembly containing Program for [Handler] types and registers them as singletons.
+// Scans the assembly containing Program for [Handler] types and registers them as scoped services.
 services.AddDouglasMQ(configuration, assemblyMarker: typeof(Program), serializer: typeof(MySerializer));
 ```
 
@@ -76,13 +76,35 @@ host.Run();
 | `IPublisher` | Singleton | `Publisher` with its **own** connection, opened on first publish. It keeps working while the host stops, and the container closes it on disposal |
 | `Dispatcher` | `IHostedService` | Starts consumers on host start, stops on host stop |
 
+## Handler lifetimes and scopes
+
+Handlers are registered as **scoped** by default. DouglasMQ creates a new DI scope for every attempt at handling a message, resolves the handler's dependencies from it, then disposes the handler and the scope once the attempt finishes. That means handlers can safely depend on scoped services such as an EF Core `DbContext`, and a retry never reuses a scoped service that a failed attempt left in a bad state.
+
+| Handler lifetime | Instances | Scope |
+|------------------|-----------|-------|
+| `Scoped` (default) | New handler per handling attempt | New scope per handling attempt |
+| `Transient` | New handler per handling attempt | New scope per handling attempt |
+| `Singleton` | One handler for every message | None: it cannot depend on scoped services |
+
+Choose a lifetime when registering:
+
+```csharp
+services.AddConsumer<OrderPlaced, OrderPlacedHandler>();                           // scoped
+services.AddConsumer<OrderPlaced, AuditHandler>(ServiceLifetime.Singleton);        // one instance
+services.AutoRegisterConsumers(typeof(Program), ServiceLifetime.Transient);
+```
+
+Handlers you register yourself (`services.AddScoped<IHandler<OrderPlaced>, OrderPlacedHandler>()`, or a factory such as `AddTransient<IHandler<OrderPlaced>>(sp => ...)`) follow the lifetime you give them.
+
+Each scoped or transient handler is created once in a throwaway scope when the host starts. A handler with a missing dependency therefore fails at startup, not on its first message.
+
 ## Individual extension methods
 
 ```csharp
-// Register a single handler manually
+// Register a single handler manually (scoped unless you pass a lifetime)
 services.AddConsumer<OrderPlaced, OrderPlacedHandler>();
 
-// Register only handlers (no full wiring)
+// Register only handlers (no full wiring; scoped unless you pass a lifetime)
 services.AutoRegisterConsumers(typeof(Program));
 
 // Register a serializer

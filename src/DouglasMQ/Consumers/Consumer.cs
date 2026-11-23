@@ -82,13 +82,20 @@ namespace DouglasMQ
 			HandlerAttribute attribute,
 			object handler,
 			Type? messageType = null)
-			=> new Consumer(
-				connection,
-				serializer,
-				logger,
-				configuration,
-				attribute,
-				HandlerInvoker.Create(handler, messageType));
+			=> Create(connection, serializer, logger, configuration, attribute, HandlerInvoker.Create(handler, messageType));
+
+		/// <summary>
+		/// Creates a new <see cref="Consumer"/> that dispatches through <paramref name="invoker"/>, for
+		/// example one that resolves the handler in a new dependency injection scope per message.
+		/// </summary>
+		public static Consumer Create(
+			IConnection connection,
+			ISerializer serializer,
+			ILogger logger,
+			Configuration configuration,
+			HandlerAttribute attribute,
+			HandlerInvoker invoker)
+			=> new Consumer(connection, serializer, logger, configuration, attribute, invoker);
 
 		/// <summary>
 		/// Declares topology, sets QoS, and begins consuming messages.

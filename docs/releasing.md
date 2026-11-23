@@ -57,8 +57,8 @@ dotnet pack src/DouglasMQ -c Release -o ./artifacts
 ```
 
 This produces two files in `./artifacts/`:
-- `DouglasMQ.{version}.nupkg` — the package consumers install
-- `DouglasMQ.{version}.snupkg` — symbol package for debugger step-through
+- `PontiusTheBarbarian.DouglasMQ.{version}.nupkg` — the package consumers install
+- `PontiusTheBarbarian.DouglasMQ.{version}.snupkg` — symbol package for debugger step-through
 
 ### Inspecting package contents
 
@@ -66,7 +66,7 @@ Use the NuGet Package Explorer or extract the `.nupkg` (it is a zip):
 
 ```bash
 # List contents
-unzip -l artifacts/DouglasMQ.*.nupkg
+unzip -l artifacts/PontiusTheBarbarian.DouglasMQ.*.nupkg
 
 # Verify these are present:
 # lib/net10.0/DouglasMQ.dll         — the assembly
@@ -131,15 +131,19 @@ Local builds are unaffected — `ContinuousIntegrationBuild` is only `true` in C
 
 ## Publishing to NuGet.org
 
+### Package ID
+
+The package is published as **`PontiusTheBarbarian.DouglasMQ`**. The assembly and namespaces stay `DouglasMQ`, so `using DouglasMQ;` is unchanged. Prefixing the ID with the owner name makes it harder for someone else to publish a lookalike package. To fully protect the prefix, [reserve it on nuget.org](https://learn.microsoft.com/nuget/nuget-org/id-prefix-reservation): only reserved-prefix owners can then publish `PontiusTheBarbarian.*` packages, and nuget.org shows a verified badge on them.
+
 ### Manual push
 
 ```bash
-dotnet nuget push artifacts/DouglasMQ.*.nupkg \
+dotnet nuget push artifacts/PontiusTheBarbarian.DouglasMQ.*.nupkg \
   --api-key $NUGET_API_KEY \
   --source https://api.nuget.org/v3/index.json \
   --skip-duplicate
 
-dotnet nuget push artifacts/DouglasMQ.*.snupkg \
+dotnet nuget push artifacts/PontiusTheBarbarian.DouglasMQ.*.snupkg \
   --api-key $NUGET_API_KEY \
   --source https://api.nuget.org/v3/index.json \
   --skip-duplicate

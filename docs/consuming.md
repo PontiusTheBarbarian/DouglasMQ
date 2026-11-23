@@ -53,6 +53,8 @@ public class OrderNotificationHandler : IHandler<OrderPlaced>
 }
 ```
 
+Handlers are scoped by default: each message is handled in its own DI scope, so scoped dependencies such as a `DbContext` get a fresh instance per message. See [handler lifetimes and scopes](di-integration.md#handler-lifetimes-and-scopes).
+
 Register the dependency first, then auto-register handlers:
 
 ```csharp
@@ -115,4 +117,4 @@ new DouglasMQBuilder()
 
 ## Lifecycle
 
-Each handler gets one `Consumer` instance which owns one RabbitMQ channel. The channel is created in `Dispatcher.StartAsync` and torn down in `DisposeAsync`. Handlers themselves are long-lived singletons for the duration of the application.
+Each handler gets one `Consumer` instance which owns one RabbitMQ channel. The channel is created in `Dispatcher.StartAsync` and torn down in `DisposeAsync`. With Microsoft DI, handlers are scoped by default: a new handler instance and DI scope are created for each handling attempt and disposed afterwards. Singleton handlers, and handler instances passed to `DouglasMQBuilder`, live for the whole application.
