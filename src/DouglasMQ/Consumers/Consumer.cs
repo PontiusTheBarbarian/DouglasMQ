@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using DouglasMQ.Diagnostics;
+using DouglasMQ.Messages;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
@@ -143,44 +146,175 @@ namespace DouglasMQ
 		{
 			var stoppingToken = _stopping.Token;
 
-			bool handled;
-			try
-			{
-				handled = await TryHandleAsync(eventArgs, stoppingToken);
-			}
-			catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-			{
-				// Shutting down mid-processing: leave the delivery unacknowledged. The broker
-				// requeues it when the channel closes, so another consumer can pick it up.
-				_logger.LogInformation("Consumer {ConsumerTag} stopping; delivery {DeliveryTag} will be redelivered.",
-					_attribute.ConsumerTag, eventArgs.DeliveryTag);
-				return;
-			}
+			using var activity = StartProcessActivity(eventArgs);
+			var telemetry = new DeliveryTelemetry(activity);
+			var startTimestamp = Stopwatch.GetTimestamp();
 
 			try
 			{
-				// CancellationToken.None: an ack/nack must not be skipped because of cancellation,
-				// otherwise the message is stuck unacknowledged and holds a prefetch slot.
-				if (handled)
+				bool handled;
+				try
 				{
-					await channel.BasicAckAsync(eventArgs.DeliveryTag, multiple: false, CancellationToken.None);
+					handled = await TryHandleAsync(eventArgs, telemetry, stoppingToken);
 				}
-				else
+				catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
 				{
-					await channel.BasicNackAsync(eventArgs.DeliveryTag, multiple: false, requeue: false, CancellationToken.None);
+					// Shutting down mid-processing: leave the delivery unacknowledged. The broker
+					// requeues it when the channel closes, so another consumer can pick it up.
+					_logger.LogInformation("Consumer {ConsumerTag} stopping; delivery {DeliveryTag} will be redelivered.",
+						_attribute.ConsumerTag, eventArgs.DeliveryTag);
+					telemetry.Outcome = MessagingTags.OutcomeRequeued;
+					return;
+				}
+
+				telemetry.Outcome = handled ? MessagingTags.OutcomeAck : MessagingTags.OutcomeDeadLettered;
+
+				try
+				{
+					// CancellationToken.None: an ack/nack must not be skipped because of cancellation,
+					// otherwise the message is stuck unacknowledged and holds a prefetch slot.
+					if (handled)
+					{
+						await channel.BasicAckAsync(eventArgs.DeliveryTag, multiple: false, CancellationToken.None);
+					}
+					else
+					{
+						await channel.BasicNackAsync(eventArgs.DeliveryTag, multiple: false, requeue: false, CancellationToken.None);
+					}
+				}
+				catch (Exception ex) when (!channel.IsOpen)
+				{
+					// Channel went away between handling and settling. Nothing else can be done here;
+					// the broker will redeliver the message.
+					_logger.LogWarning(ex, "Could not settle delivery {DeliveryTag} on {ConsumerTag}: channel is closed. It will be redelivered.",
+						eventArgs.DeliveryTag, _attribute.ConsumerTag);
+					telemetry.Outcome = MessagingTags.OutcomeRequeued;
+					activity?.AddException(ex);
 				}
 			}
-			catch (Exception ex) when (!channel.IsOpen)
+			finally
 			{
-				// Channel went away between handling and settling. Nothing else can be done here;
-				// the broker will redeliver the message.
-				_logger.LogWarning(ex, "Could not settle delivery {DeliveryTag} on {ConsumerTag}: channel is closed. It will be redelivered.",
-					eventArgs.DeliveryTag, _attribute.ConsumerTag);
+				RecordDelivery(telemetry, Stopwatch.GetElapsedTime(startTimestamp));
 			}
 		}
 
+		/// <summary>
+		/// Mutable per-delivery state collected while handling, then written to the span and metrics once.
+		/// </summary>
+		private sealed class DeliveryTelemetry
+		{
+			public DeliveryTelemetry(Activity? activity) => Activity = activity;
+
+			public Activity? Activity { get; }
+
+			public string? Outcome { get; set; }
+
+			public string? ErrorType { get; set; }
+
+			public int Retries { get; set; }
+		}
+
+		private void RecordDelivery(DeliveryTelemetry telemetry, TimeSpan elapsed)
+		{
+			var activity = telemetry.Activity;
+			if (activity is not null)
+			{
+				activity.SetTag(MessagingTags.RetryCount, telemetry.Retries);
+				activity.SetTag(MessagingTags.Outcome, telemetry.Outcome);
+				if (telemetry.ErrorType is not null)
+				{
+					activity.SetTag(MessagingTags.ErrorType, telemetry.ErrorType);
+				}
+
+				if (telemetry.Outcome == MessagingTags.OutcomeDeadLettered)
+				{
+					activity.SetStatus(ActivityStatusCode.Error, $"Message dead-lettered ({telemetry.ErrorType}).");
+				}
+			}
+
+			var tags = new TagList
+			{
+				{ MessagingTags.System, MessagingTags.SystemValue },
+				{ MessagingTags.DestinationName, _attribute.ExchangeName },
+				{ MessagingTags.SubscriptionName, _attribute.QueueName },
+				{ MessagingTags.Handler, _invoker.HandlerName },
+				{ MessagingTags.MessageType, _invoker.MessageType.Name },
+			};
+
+			if (telemetry.Outcome is not null)
+			{
+				tags.Add(MessagingTags.Outcome, telemetry.Outcome);
+			}
+
+			if (telemetry.ErrorType is not null)
+			{
+				tags.Add(MessagingTags.ErrorType, telemetry.ErrorType);
+			}
+
+			DouglasMQTelemetry.MessagesConsumed.Add(1, tags);
+			if (telemetry.Outcome == MessagingTags.OutcomeDeadLettered)
+			{
+				DouglasMQTelemetry.MessagesDeadLettered.Add(1, tags);
+			}
+
+			DouglasMQTelemetry.ProcessDuration.Record(elapsed.TotalSeconds, tags);
+		}
+
+		private Activity? StartProcessActivity(BasicDeliverEventArgs eventArgs)
+		{
+			if (!DouglasMQTelemetry.ActivitySource.HasListeners())
+			{
+				return null;
+			}
+
+			var headers = eventArgs.BasicProperties?.Headers;
+			var remoteContext = DouglasMQTelemetry.ExtractContext(headers);
+
+			// RabbitMQ.Client's own "deliver" activity may already be current and parented on the
+			// same remote context. Nest under it in that case; otherwise parent on the publisher's context.
+			var current = Activity.Current;
+			var parent = current is not null && (remoteContext == default || current.TraceId == remoteContext.TraceId)
+				? current.Context
+				: remoteContext;
+
+			var activity = DouglasMQTelemetry.ActivitySource.StartActivity(
+				$"process {_attribute.QueueName}",
+				ActivityKind.Consumer,
+				parent);
+
+			if (activity is null)
+			{
+				return null;
+			}
+
+			foreach (var baggage in DouglasMQTelemetry.ExtractBaggage(headers))
+			{
+				if (activity.GetBaggageItem(baggage.Key) is null)
+				{
+					activity.SetBaggage(baggage.Key, baggage.Value);
+				}
+			}
+
+			if (activity.IsAllDataRequested)
+			{
+				activity.SetTag(MessagingTags.System, MessagingTags.SystemValue);
+				activity.SetTag(MessagingTags.OperationName, "process");
+				activity.SetTag(MessagingTags.OperationType, "process");
+				activity.SetTag(MessagingTags.DestinationName, _attribute.ExchangeName);
+				activity.SetTag(MessagingTags.SubscriptionName, _attribute.QueueName);
+				activity.SetTag(MessagingTags.RoutingKey, eventArgs.RoutingKey);
+				activity.SetTag(MessagingTags.DeliveryTag, (long)eventArgs.DeliveryTag);
+				activity.SetTag(MessagingTags.Redelivered, eventArgs.Redelivered);
+				activity.SetTag(MessagingTags.BodySize, eventArgs.Body.Length);
+				activity.SetTag(MessagingTags.Handler, _invoker.HandlerName);
+				activity.SetTag(MessagingTags.MessageType, _invoker.MessageType.Name);
+			}
+
+			return activity;
+		}
+
 		/// <returns><c>true</c> to ack; <c>false</c> to dead-letter.</returns>
-		private async Task<bool> TryHandleAsync(BasicDeliverEventArgs eventArgs, CancellationToken stoppingToken)
+		private async Task<bool> TryHandleAsync(BasicDeliverEventArgs eventArgs, DeliveryTelemetry telemetry, CancellationToken stoppingToken)
 		{
 			object? message;
 			try
@@ -193,6 +327,8 @@ namespace DouglasMQ
 				// Poison message: retrying cannot help, so dead-letter immediately.
 				_logger.LogError(ex, "Failed to deserialize message for {MessageType} on {ConsumerTag}. Dead-lettering.",
 					_invoker.MessageType.Name, _attribute.ConsumerTag);
+				telemetry.ErrorType = ex.GetType().FullName;
+				telemetry.Activity?.AddException(ex);
 				return false;
 			}
 
@@ -200,7 +336,14 @@ namespace DouglasMQ
 			{
 				_logger.LogWarning("Received null message for {MessageType} on {ConsumerTag}. Dead-lettering.",
 					_invoker.MessageType.Name, _attribute.ConsumerTag);
+				telemetry.ErrorType = "deserialization_failed";
 				return false;
+			}
+
+			if (message is IMessage typedMessage && telemetry.Activity is { IsAllDataRequested: true } activity)
+			{
+				activity.SetTag(MessagingTags.MessageId, typedMessage.MessageId.ToString());
+				activity.SetTag(MessagingTags.ConversationId, typedMessage.TraceId.ToString());
 			}
 
 			var lastException = default(Exception);
@@ -211,6 +354,21 @@ namespace DouglasMQ
 					var delay = GetRetryDelay(attempt);
 					_logger.LogWarning("Retrying handler {Handler} for message {MessageType}, attempt {Attempt}/{RetryCount} after {DelayMs}ms.",
 						_invoker.HandlerName, _invoker.MessageType.Name, attempt, _retryCount, delay.TotalMilliseconds);
+
+					telemetry.Retries = attempt;
+					DouglasMQTelemetry.HandlerRetries.Add(1, new TagList
+					{
+						{ MessagingTags.System, MessagingTags.SystemValue },
+						{ MessagingTags.DestinationName, _attribute.ExchangeName },
+						{ MessagingTags.SubscriptionName, _attribute.QueueName },
+						{ MessagingTags.Handler, _invoker.HandlerName },
+						{ MessagingTags.MessageType, _invoker.MessageType.Name },
+					});
+					telemetry.Activity?.AddEvent(new ActivityEvent("douglasmq.retry", tags: new ActivityTagsCollection
+					{
+						{ MessagingTags.Attempt, attempt },
+						{ "douglasmq.retry.delay_ms", delay.TotalMilliseconds },
+					}));
 
 					// Throws OperationCanceledException on shutdown, handled by the caller.
 					await Task.Delay(delay, stoppingToken);
@@ -230,12 +388,16 @@ namespace DouglasMQ
 					// Includes OperationCanceledException raised by the handler itself (e.g. an
 					// HttpClient timeout), which is a handler failure, not a consumer shutdown.
 					lastException = ex;
+
+					// Record every failed attempt so the trace shows the full retry history.
+					telemetry.Activity?.AddException(ex, new TagList { { MessagingTags.Attempt, attempt } });
 				}
 			}
 
 			_logger.LogError(lastException,
 				"Handler {Handler} failed for message {MessageType} after {Attempts} attempt(s). Dead-lettering.",
 				_invoker.HandlerName, _invoker.MessageType.Name, _retryCount + 1);
+			telemetry.ErrorType = lastException?.GetType().FullName;
 			return false;
 		}
 
