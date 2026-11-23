@@ -493,7 +493,7 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
-      "douglasmq": {
+      "PontiusTheBarbarian.DouglasMQ": {
         "type": "Project",
         "dependencies": {
           "Microsoft.Extensions.Configuration.Binder": "[10.0.0, )",

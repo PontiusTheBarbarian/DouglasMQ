@@ -3,7 +3,7 @@
 A strongly-typed RabbitMQ wrapper for .NET with built-in retry, dead-lettering, QoS, and Microsoft DI support. Usable with or without a dependency injection container.
 
 ```
-dotnet add package DouglasMQ
+dotnet add package PontiusTheBarbarian.DouglasMQ
 ```
 
 ---
