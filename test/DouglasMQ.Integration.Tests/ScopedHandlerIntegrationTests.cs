@@ -47,6 +47,9 @@ namespace DouglasMQ.Integration.Tests
 			await host.StartAsync();
 			try
 			{
+				// AddDouglasMQ starts consumers in the background.
+				await RabbitMqFixture.WaitForConsumersAsync(host.Services);
+
 				var publisher = host.Services.GetRequiredService<IPublisher>();
 				await publisher.PublishAsync(new ScopedEvent());
 				await publisher.PublishAsync(new ScopedEvent());

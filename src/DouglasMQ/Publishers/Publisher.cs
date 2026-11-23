@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using DouglasMQ.Diagnostics;
 using DouglasMQ.Messages;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Logging;
@@ -108,31 +111,60 @@ namespace DouglasMQ
 
 			// Resolve the route before touching the network, so a missing [Message] fails fast.
 			var route = MessageRoute<TMessage>.Require();
-			var channel = await GetOrCreateChannelAsync(cancellationToken);
-			var body = _serializer.SerializeToBytes(message);
 
-			// Persistent (delivery mode 2) so messages survive a broker restart when routed to
-			// durable queues. Identity/correlation are surfaced as standard AMQP properties so
-			// they are visible to tooling and non-DouglasMQ consumers without deserializing the body.
-			var properties = new BasicProperties
+			using var activity = DouglasMQTelemetry.ActivitySource.StartActivity($"{route.ExchangeName} publish", ActivityKind.Producer);
+			if (activity is { IsAllDataRequested: true })
 			{
-				Persistent = true,
-				MessageId = message.MessageId.ToString(),
-				CorrelationId = message.TraceId.ToString(),
-				Type = MessageRoute<TMessage>.TypeName,
-				Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
-			};
+				activity.SetTag(MessagingTags.System, MessagingTags.SystemValue);
+				activity.SetTag(MessagingTags.OperationType, "send");
+				activity.SetTag(MessagingTags.DestinationName, route.ExchangeName);
+				activity.SetTag(MessagingTags.RoutingKey, route.RoutingKey);
+				activity.SetTag(MessagingTags.MessageId, message.MessageId.ToString());
+				activity.SetTag(MessagingTags.ConversationId, message.TraceId.ToString());
+				activity.SetTag(MessagingTags.MessageType, typeof(TMessage).Name);
+			}
 
-			_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
-				typeof(TMessage).Name, message.MessageId, route.ExchangeName, route.RoutingKey);
+			try
+			{
+				var channel = await GetOrCreateChannelAsync(cancellationToken);
+				var body = _serializer.SerializeToBytes(message);
 
-			await channel.BasicPublishAsync(
-				exchange: route.ExchangeName,
-				routingKey: route.RoutingKey,
-				mandatory: false,
-				basicProperties: properties,
-				body: body,
-				cancellationToken: cancellationToken);
+				// W3C trace context (traceparent/tracestate/baggage) travels in the headers, so the
+				// consumer's process span joins the publisher's trace.
+				var headers = new Dictionary<string, object?>();
+				DouglasMQTelemetry.InjectContext(activity ?? Activity.Current, headers);
+
+				// Persistent (delivery mode 2) so messages survive a broker restart when routed to
+				// durable queues. Identity/correlation are surfaced as standard AMQP properties so
+				// they are visible to tooling and non-DouglasMQ consumers without deserializing the body.
+				var properties = new BasicProperties
+				{
+					Persistent = true,
+					MessageId = message.MessageId.ToString(),
+					CorrelationId = message.TraceId.ToString(),
+					Type = MessageRoute<TMessage>.TypeName,
+					Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+					Headers = headers.Count > 0 ? headers : null,
+				};
+
+				_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
+					typeof(TMessage).Name, message.MessageId, route.ExchangeName, route.RoutingKey);
+
+				await channel.BasicPublishAsync(
+					exchange: route.ExchangeName,
+					routingKey: route.RoutingKey,
+					mandatory: false,
+					basicProperties: properties,
+					body: body,
+					cancellationToken: cancellationToken);
+			}
+			catch (Exception ex) when (activity is not null)
+			{
+				activity.SetStatus(ActivityStatusCode.Error, ex.Message);
+				activity.SetTag(MessagingTags.ErrorType, ex.GetType().FullName);
+				activity.AddException(ex);
+				throw;
+			}
 		}
 
 		private async ValueTask<IChannel> GetOrCreateChannelAsync(CancellationToken cancellationToken)

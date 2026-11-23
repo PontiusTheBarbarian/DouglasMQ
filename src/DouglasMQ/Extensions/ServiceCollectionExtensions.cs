@@ -148,13 +148,16 @@ namespace DouglasMQ
 					configuration,
 					provider.GetRequiredService<ISerializer>(),
 					provider.GetRequiredService<ILogger<Publisher>>()))
-				// The Dispatcher opens (and owns) the consumer connection when the host starts it, so
-				// building the container never blocks on network I/O.
-				.AddHostedService(provider => Dispatcher.Create(
+				// The Dispatcher opens (and owns) the consumer connection in the background once the host
+				// starts it, retrying while the broker is unreachable, so neither building the container nor
+				// starting the host blocks on (or fails because of) the network.
+				.AddSingleton(provider => Dispatcher.Create(
 					provider.GetRequiredService<IReadOnlyList<HandlerRegistration>>(),
 					provider.GetRequiredService<ISerializer>(),
 					configuration,
-					provider.GetRequiredService<ILoggerFactory>()));
+					provider.GetRequiredService<ILoggerFactory>()))
+				.AddSingleton<IDouglasMQStatus>(provider => provider.GetRequiredService<Dispatcher>())
+				.AddHostedService(provider => provider.GetRequiredService<Dispatcher>());
 
 			return services;
 		}

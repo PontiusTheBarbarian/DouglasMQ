@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using DouglasMQ.Serialization;
@@ -10,16 +11,24 @@ using RabbitMQ.Client;
 namespace DouglasMQ
 {
 	/// <summary>
-	/// Runs every consumer: on start it opens the consumer connection, declares the dead-letter
-	/// topology and starts one <see cref="Consumer"/> per <see cref="HandlerRegistration"/>; on stop it
-	/// shuts them down and closes the connection. Used as an <see cref="IHostedService"/> under
-	/// Microsoft DI and returned directly by <see cref="DouglasMQBuilder.StartConsumersAsync"/>.
+	/// Runs every consumer: opens the consumer connection, declares the dead-letter topology and starts
+	/// one <see cref="Consumer"/> per <see cref="HandlerRegistration"/>; on stop, shuts them down and
+	/// closes the connection.
 	/// </summary>
 	/// <remarks>
-	/// If startup fails part-way, whatever was already opened is released before the exception
-	/// propagates, so callers never have to clean up after a failed start.
+	/// <para>
+	/// As an <see cref="IHostedService"/> (under Microsoft DI), <see cref="StartAsync"/> returns at once and
+	/// set-up runs in the background, retrying with a growing delay while the broker is unreachable, so the
+	/// host starts and can report the outage instead of crashing. <see cref="DouglasMQBuilder.StartConsumersAsync"/>
+	/// uses <see cref="StartAndWaitAsync"/> instead, which makes one attempt and throws if it fails.
+	/// </para>
+	/// <para>
+	/// If an attempt fails part-way, whatever it opened is released before retrying or throwing.
+	/// Shutdown happens once, however many <see cref="StopAsync"/> and <see cref="DisposeAsync"/> calls
+	/// overlap, and every caller waits for it to finish.
+	/// </para>
 	/// </remarks>
-	internal sealed class Dispatcher : IHostedService, IAsyncDisposable
+	internal sealed class Dispatcher : IHostedService, IAsyncDisposable, IDouglasMQStatus
 	{
 		private readonly Func<CancellationToken, Task<IConnection>> _connectionFactory;
 		private readonly IReadOnlyList<HandlerRegistration> _registrations;
@@ -27,11 +36,18 @@ namespace DouglasMQ
 		private readonly Configuration _configuration;
 		private readonly ILoggerFactory _loggerFactory;
 		private readonly ILogger<Dispatcher> _logger;
+
+		// Cancelled when shutdown begins, ending the background start-up loop and its retry delays.
+		private readonly CancellationTokenSource _lifetime = new();
+		private readonly object _gate = new();
 		private readonly List<Consumer> _consumers = new();
 		private IConnection? _connection;
-		private bool _disposed;
+		private Task? _startupLoop;
+		private Task? _shutdownTask;
+		private bool _started;
+		private volatile bool _running;
 
-		/// <param name="connectionFactory">Opens the consumer connection. Called once, from <see cref="StartAsync"/>; the dispatcher owns the result.</param>
+		/// <param name="connectionFactory">Opens the consumer connection. The dispatcher owns the result.</param>
 		/// <param name="registrations">The consumers to start.</param>
 		/// <param name="serializer">Deserializes message bodies.</param>
 		/// <param name="configuration">Supplies QoS and retry settings.</param>
@@ -62,24 +78,101 @@ namespace DouglasMQ
 				configuration,
 				loggerFactory);
 
-		/// <summary>
-		/// Opens the consumer connection, declares the dead-letter topology and starts every consumer.
-		/// </summary>
-		public async Task StartAsync(CancellationToken cancellationToken)
-		{
-			ObjectDisposedException.ThrowIf(_disposed, this);
-			if (_connection is not null)
-			{
-				throw new InvalidOperationException("The dispatcher has already been started.");
-			}
+		/// <summary>Delay before the first background start-up retry. Doubles after each failure.</summary>
+		internal TimeSpan InitialStartupRetryDelay { get; init; } = TimeSpan.FromSeconds(2);
 
+		/// <summary>Upper bound on the background start-up retry delay.</summary>
+		internal TimeSpan MaxStartupRetryDelay { get; init; } = TimeSpan.FromMinutes(1);
+
+		/// <inheritdoc />
+		public bool ConsumersRunning => _running;
+
+		/// <summary>
+		/// Begins starting the consumers in the background and returns immediately. Set-up retries until
+		/// it succeeds or the dispatcher is stopped.
+		/// </summary>
+		public Task StartAsync(CancellationToken cancellationToken)
+		{
+			MarkStarted();
+			_startupLoop = Task.Run(() => RunStartupLoopAsync(_lifetime.Token), CancellationToken.None);
+			return Task.CompletedTask;
+		}
+
+		/// <summary>
+		/// Starts the consumers and waits until they are running. Makes a single attempt: if it fails,
+		/// everything it opened is released and the exception propagates.
+		/// </summary>
+		public async Task StartAndWaitAsync(CancellationToken cancellationToken)
+		{
+			MarkStarted();
+			using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+			await StartOnceAsync(linked.Token);
+			LogStarted();
+		}
+
+		private void MarkStarted()
+		{
+			lock (_gate)
+			{
+				ObjectDisposedException.ThrowIf(_shutdownTask is not null, this);
+				if (_started)
+				{
+					throw new InvalidOperationException("The dispatcher has already been started.");
+				}
+
+				_started = true;
+			}
+		}
+
+		private async Task RunStartupLoopAsync(CancellationToken stoppingToken)
+		{
+			var delay = InitialStartupRetryDelay;
+			for (var attempt = 1; ; attempt++)
+			{
+				try
+				{
+					await StartOnceAsync(stoppingToken);
+					LogStarted();
+					return;
+				}
+				catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+				{
+					return;
+				}
+				catch (Exception ex)
+				{
+					_logger.LogWarning(ex,
+						"DouglasMQ could not start its consumers (attempt {Attempt}). Retrying in {RetryDelay}.",
+						attempt, delay);
+				}
+
+				try
+				{
+					await Task.Delay(delay, stoppingToken);
+				}
+				catch (OperationCanceledException)
+				{
+					return;
+				}
+
+				delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, MaxStartupRetryDelay.Ticks));
+			}
+		}
+
+		private void LogStarted()
+			=> _logger.LogInformation("DouglasMQ consumers started: {ConsumerCount} consumer(s) running.", _consumers.Count);
+
+		/// <summary>
+		/// One start-up attempt: open the connection, declare the dead-letter topology, start every consumer.
+		/// On failure, releases what it opened and rethrows.
+		/// </summary>
+		private async Task StartOnceAsync(CancellationToken cancellationToken)
+		{
 			try
 			{
-				_logger.LogInformation("DouglasMQ dispatcher starting. Declaring DLX topology.");
 				_connection = await _connectionFactory(cancellationToken);
 				await DeclareDeadLetterAsync(_connection, cancellationToken);
 
-				_logger.LogInformation("Starting {Count} consumer(s).", _registrations.Count);
 				var consumerLogger = _loggerFactory.CreateLogger<Consumer>();
 				foreach (var registration in _registrations)
 				{
@@ -88,13 +181,11 @@ namespace DouglasMQ
 					await consumer.StartAsync(cancellationToken);
 				}
 
-				_logger.LogInformation("DouglasMQ dispatcher started.");
+				_running = true;
 			}
 			catch
 			{
-				// Startup failed part-way: release consumer channels and the connection rather than
-				// leaking them to a caller who never received a running dispatcher.
-				await ShutdownAsync();
+				await ReleaseAsync(Consumer.DefaultDrainTimeout);
 				throw;
 			}
 		}
@@ -114,44 +205,67 @@ namespace DouglasMQ
 		}
 
 		/// <summary>
-		/// Stops every consumer and closes the consumer connection.
+		/// Stops every consumer gracefully (letting in-flight handlers finish, bounded by
+		/// <paramref name="cancellationToken"/>) and closes the consumer connection.
 		/// </summary>
-		public async Task StopAsync(CancellationToken cancellationToken)
-		{
-			_logger.LogInformation("DouglasMQ dispatcher stopping.");
-			await ShutdownAsync();
-		}
+		public Task StopAsync(CancellationToken cancellationToken) => ShutdownAsync(cancellationToken);
 
 		/// <summary>
-		/// Stops every consumer and closes the consumer connection, if not already done.
+		/// Stops every consumer and closes the consumer connection, if not already done or under way.
 		/// </summary>
 		public async ValueTask DisposeAsync()
 		{
-			_disposed = true;
-			await ShutdownAsync();
+			using var timeout = new CancellationTokenSource(Consumer.DefaultDrainTimeout);
+			await ShutdownAsync(timeout.Token);
 		}
 
-		private async Task ShutdownAsync()
+		private Task ShutdownAsync(CancellationToken cancellationToken)
 		{
-			// Disposing a consumer cancels its in-flight processing token and closes its channel,
-			// so unfinished deliveries are returned to the broker rather than left dangling.
-			// Consumer disposal is idempotent, and the connection is detached before closing, so
-			// StopAsync followed by DisposeAsync (as the host does) shuts down once.
+			lock (_gate)
+			{
+				// Every caller, overlapping or later, awaits the first caller's shutdown.
+				_shutdownTask ??= Task.Run(() => ShutdownCoreAsync(cancellationToken), CancellationToken.None);
+				return _shutdownTask;
+			}
+		}
+
+		private async Task ShutdownCoreAsync(CancellationToken cancellationToken)
+		{
+			_logger.LogInformation("DouglasMQ dispatcher stopping.");
+			await _lifetime.CancelAsync();
+
+			if (_startupLoop is { } startupLoop)
+			{
+				// The loop exits promptly once cancelled (and has released a half-finished attempt).
+				await startupLoop;
+			}
+
+			await ReleaseAsync(cancellationToken);
+		}
+
+		/// <summary>
+		/// Stops the consumers (concurrently, so they share the drain timeout) and closes the connection.
+		/// </summary>
+		private async Task ReleaseAsync(CancellationToken drainToken)
+		{
+			_running = false;
 			try
 			{
-				foreach (var consumer in _consumers)
-				{
-					await consumer.DisposeAsync();
-				}
+				await Task.WhenAll(_consumers.Select(consumer => consumer.StopAsync(drainToken)));
 			}
 			finally
 			{
 				_consumers.Clear();
-
 				var connection = _connection;
 				_connection = null;
 				await AmqpResources.CloseAndDisposeAsync(connection);
 			}
+		}
+
+		private async Task ReleaseAsync(TimeSpan drainTimeout)
+		{
+			using var timeout = new CancellationTokenSource(drainTimeout);
+			await ReleaseAsync(timeout.Token);
 		}
 	}
 }

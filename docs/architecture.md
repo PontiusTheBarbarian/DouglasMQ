@@ -63,9 +63,9 @@ Both front-ends, `DouglasMQBuilder` and `ServiceCollectionExtensions`, produce o
 |------|---------|
 | `HandlerRegistration` | One consumer to start: the `[Handler]` binding plus a `HandlerInvoker` |
 | `HandlerInvoker` | Strongly-typed call into `IHandler<T>.HandleAsync`, optionally in a new DI scope per message |
-| `Dispatcher` | Opens the consumer connection on start, declares the DLX, starts one `Consumer` per registration, and releases everything if startup fails. An `IHostedService` under DI; returned directly by `StartConsumersAsync` |
-| `Consumer` | Transport adapter: owns one `IChannel`, applies QoS, and acks/nacks according to the `DeliveryProcessor`'s outcome |
-| `DeliveryProcessor` | Body in, `DeliveryOutcome` (`Ack` / `DeadLetter` / `Abandon`) out: deserializes, invokes, retries. No RabbitMQ types |
+| `Dispatcher` | Opens the consumer connection, declares the DLX, starts one `Consumer` per registration, and releases everything if an attempt fails. Under DI it is the `IHostedService` and `IDouglasMQStatus`, starting in the background with retries; `StartConsumersAsync` starts it in the foreground. Shuts down exactly once however calls overlap |
+| `Consumer` | Transport adapter: owns one `IChannel`, applies QoS, acks/nacks according to the `DeliveryProcessor`'s outcome, and stops gracefully (cancel subscription, drain in-flight handlers, close) |
+| `DeliveryProcessor` | Body in, `DeliveryOutcome` (`Ack` / `DeadLetter` / `Abandon`) out: deserializes, invokes, retries, honours `NonRetryableException`, and wraps each attempt in a span and log scope. No RabbitMQ types |
 | `RetryPolicy` | Retry count and capped exponential backoff |
 | `Topology` | The only place exchanges, queues and bindings are declared, including the `dlx.*` names |
 | `MessageRoute<T>` | `[Message]` routing data, resolved once per message type |

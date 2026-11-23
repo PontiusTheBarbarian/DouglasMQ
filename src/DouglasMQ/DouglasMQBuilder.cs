@@ -119,12 +119,17 @@ namespace DouglasMQ
 		/// <summary>
 		/// Opens a dedicated consumer connection, declares DLX topology, starts all registered
 		/// consumers and returns an <see cref="IAsyncDisposable"/> that stops them and closes the
-		/// connection on disposal. If startup fails, everything opened so far is released.
+		/// connection on disposal. Unlike <c>AddDouglasMQ</c>, this waits until the consumers are running
+		/// and throws if the broker is unreachable; everything opened so far is then released.
 		/// </summary>
+		/// <remarks>
+		/// Disposing the result stops consumers gracefully: in-flight handlers get up to 30 seconds to
+		/// finish and settle. The result also implements <see cref="IDouglasMQStatus"/>.
+		/// </remarks>
 		public async Task<IAsyncDisposable> StartConsumersAsync(CancellationToken cancellationToken = default)
 		{
 			var dispatcher = Dispatcher.Create(_registrations.ToList(), _serializer, _configuration, _loggerFactory);
-			await dispatcher.StartAsync(cancellationToken);
+			await dispatcher.StartAndWaitAsync(cancellationToken);
 			return dispatcher;
 		}
 

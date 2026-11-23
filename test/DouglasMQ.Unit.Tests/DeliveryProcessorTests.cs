@@ -14,16 +14,18 @@ namespace DouglasMQ.Unit.Tests
 	/// </summary>
 	public class DeliveryProcessorTests
 	{
+		private static readonly HandlerAttribute Binding = new(ExchangeType.direct, "test.exchange", "test.queue", "test.key");
+
 		private static DeliveryProcessor CreateProcessor(object handler, int retryCount = 2, int retryDelayMs = 0, Type? messageType = null)
 			=> new(
 				new JsonSerializer(),
 				HandlerInvoker.Create(handler, messageType),
 				new RetryPolicy(retryCount, retryDelayMs),
 				NullLogger.Instance,
-				"test-consumer");
+				Binding);
 
 		private static Task<DeliveryOutcome> ProcessAsync(DeliveryProcessor processor, string body, CancellationToken stoppingToken = default)
-			=> processor.ProcessAsync(Encoding.UTF8.GetBytes(body), stoppingToken);
+			=> processor.ProcessAsync(Encoding.UTF8.GetBytes(body), DeliveryInfo.Empty, stoppingToken);
 
 		private static string ValidBody => """{"Value":"hello"}""";
 
@@ -83,6 +85,67 @@ namespace DouglasMQ.Unit.Tests
 
 			Assert.Equal(DeliveryOutcome.DeadLetter, outcome);
 			Assert.Equal(2, handler.Attempts);
+		}
+
+		[Fact]
+		public async Task NonRetryableException_DeadLettersAfterOneAttempt_WithoutWaiting()
+		{
+			var handler = new RecordingHandler { Throw = () => new NonRetryableException("Quantity must be positive.") };
+			var processor = CreateProcessor(handler, retryCount: 3, retryDelayMs: 60_000);
+
+			var outcome = await ProcessAsync(processor, ValidBody).WaitAsync(TimeSpan.FromSeconds(5));
+
+			Assert.Equal(DeliveryOutcome.DeadLetter, outcome);
+			Assert.Equal(1, handler.Attempts);
+		}
+
+		[Fact]
+		public async Task NonRetryableException_AsInnerException_AlsoSkipsRetries()
+		{
+			var handler = new RecordingHandler
+			{
+				Throw = () => new InvalidOperationException("wrapped", new NonRetryableException("invalid")),
+			};
+
+			var outcome = await ProcessAsync(CreateProcessor(handler, retryCount: 3, retryDelayMs: 60_000), ValidBody).WaitAsync(TimeSpan.FromSeconds(5));
+
+			Assert.Equal(DeliveryOutcome.DeadLetter, outcome);
+			Assert.Equal(1, handler.Attempts);
+		}
+
+		[Fact]
+		public async Task NonRetryableException_InsideAggregateException_AlsoSkipsRetries()
+		{
+			var handler = new RecordingHandler
+			{
+				Throw = () => new AggregateException(new InvalidOperationException("other"), new NonRetryableException("invalid")),
+			};
+
+			var outcome = await ProcessAsync(CreateProcessor(handler, retryCount: 3, retryDelayMs: 60_000), ValidBody).WaitAsync(TimeSpan.FromSeconds(5));
+
+			Assert.Equal(DeliveryOutcome.DeadLetter, outcome);
+			Assert.Equal(1, handler.Attempts);
+		}
+
+		[Fact]
+		public async Task NonRetryableException_IsLoggedAsWarning_NamingHandlerMessageTypeAndReason()
+		{
+			var logger = new RecordingLogger();
+			var processor = new DeliveryProcessor(
+				new JsonSerializer(),
+				HandlerInvoker.Create(new RecordingHandler { Throw = () => new NonRetryableException("Quantity must be positive.") }),
+				new RetryPolicy(3, 0),
+				logger,
+				Binding);
+
+			await processor.ProcessAsync(Encoding.UTF8.GetBytes(ValidBody), DeliveryInfo.Empty, CancellationToken.None);
+
+			var entry = Assert.Single(logger.Entries, e => e.Exception is NonRetryableException);
+			Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, entry.Level);
+			Assert.Contains(nameof(RecordingHandler), entry.Message);
+			Assert.Contains(nameof(TestMessage), entry.Message);
+			Assert.Contains("Quantity must be positive.", entry.Message);
+			Assert.DoesNotContain(logger.Entries, e => e.Level >= Microsoft.Extensions.Logging.LogLevel.Error);
 		}
 
 		[Fact]
