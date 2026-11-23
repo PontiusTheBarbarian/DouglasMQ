@@ -39,5 +39,14 @@ namespace DouglasMQ.Serialization
 		/// <inheritdoc />
 		/// <exception cref="JsonException">The payload is not valid JSON for <paramref name="type"/>.</exception>
 		public object? Deserialize(string data, Type type) => JsonSerializer.Deserialize(data, type, _options);
+
+		/// <inheritdoc />
+		/// <remarks>Writes UTF-8 JSON directly, without an intermediate string.</remarks>
+		public byte[] SerializeToBytes<T>(T data) => JsonSerializer.SerializeToUtf8Bytes(data, _options);
+
+		/// <inheritdoc />
+		/// <remarks>Reads UTF-8 JSON directly, without an intermediate string.</remarks>
+		/// <exception cref="JsonException">The payload is not valid JSON for <paramref name="type"/>.</exception>
+		public object? DeserializeFromBytes(ReadOnlySpan<byte> data, Type type) => JsonSerializer.Deserialize(data, type, _options);
 	}
 }

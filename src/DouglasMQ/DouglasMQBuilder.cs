@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using DouglasMQ.Serialization;
@@ -31,7 +30,7 @@ namespace DouglasMQ
 		private Configuration _configuration = new Configuration();
 		private ISerializer _serializer = new SystemTextJsonSerializer();
 		private ILoggerFactory _loggerFactory = NullLoggerFactory.Instance;
-		private readonly List<(HandlerAttribute Attribute, object Handler)> _handlers = new();
+		private readonly List<HandlerRegistration> _registrations = new();
 
 		/// <summary>
 		/// Applies settings to the <see cref="Configuration"/> using a configuration delegate.
@@ -66,23 +65,17 @@ namespace DouglasMQ
 
 		/// <summary>
 		/// Registers a handler instance directly. The handler class must be decorated with
-		/// <see cref="HandlerAttribute"/>.
+		/// <see cref="HandlerAttribute"/> and implement exactly one <see cref="IHandler{TMessage}"/>.
 		/// </summary>
+		/// <exception cref="InvalidOperationException">
+		/// The handler is not decorated with <see cref="HandlerAttribute"/>, or does not implement exactly
+		/// one <see cref="IHandler{TMessage}"/>.
+		/// </exception>
 		public DouglasMQBuilder AddHandler(object handler)
 		{
-			if (handler is null)
-			{
-				throw new ArgumentNullException(nameof(handler));
-			}
+			ArgumentNullException.ThrowIfNull(handler);
 
-			var attribute = handler.GetType().GetCustomAttribute<HandlerAttribute>();
-			if (attribute is null)
-			{
-				throw new InvalidOperationException(
-					$"Handler '{handler.GetType().Name}' must be decorated with [{nameof(HandlerAttribute)}].");
-			}
-
-			_handlers.Add((attribute, handler));
+			_registrations.Add(HandlerRegistration.For(HandlerInvoker.Create(handler)));
 			return this;
 		}
 
@@ -97,9 +90,7 @@ namespace DouglasMQ
 
 			foreach (var handlerType in HandlerDiscovery.FindHandlerTypes(typeof(TMarker).Assembly))
 			{
-				var attribute = handlerType.GetCustomAttribute<HandlerAttribute>()!;
-				var instance = handlerFactory(handlerType);
-				_handlers.Add((attribute, instance));
+				AddHandler(handlerFactory(handlerType));
 			}
 
 			return this;
@@ -111,45 +102,30 @@ namespace DouglasMQ
 		/// </summary>
 		public async Task<IPublisher> BuildPublisherAsync(CancellationToken cancellationToken = default)
 		{
-			var connection = await ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, ConnectionFactoryBuilder.PublisherSuffix, cancellationToken);
-			return new Publisher(connection, ownsConnection: true, _serializer, _loggerFactory.CreateLogger<Publisher>(), _configuration);
+			var publisher = Publisher.Create(_configuration, _serializer, _loggerFactory.CreateLogger<Publisher>());
+			try
+			{
+				// Connect now so an unreachable broker fails the build, not the first publish.
+				await publisher.ConnectAsync(cancellationToken);
+				return publisher;
+			}
+			catch
+			{
+				await publisher.DisposeAsync();
+				throw;
+			}
 		}
 
 		/// <summary>
 		/// Opens a dedicated consumer connection, declares DLX topology, starts all registered
 		/// consumers and returns an <see cref="IAsyncDisposable"/> that stops them and closes the
-		/// connection on disposal.
+		/// connection on disposal. If startup fails, everything opened so far is released.
 		/// </summary>
 		public async Task<IAsyncDisposable> StartConsumersAsync(CancellationToken cancellationToken = default)
 		{
-			var connection = await ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, ConnectionFactoryBuilder.ConsumerSuffix, cancellationToken);
-
-			Dispatcher? dispatcher = null;
-			try
-			{
-				dispatcher = new Dispatcher(
-					connection,
-					BuildConsumers(connection),
-					_loggerFactory.CreateLogger<Dispatcher>());
-
-				await dispatcher.StartAsync(cancellationToken);
-				return dispatcher;
-			}
-			catch
-			{
-				// Startup failed part-way: release consumer channels and the connection rather
-				// than leaking them to the caller who never received a handle.
-				if (dispatcher is not null)
-				{
-					await dispatcher.DisposeAsync();
-				}
-				else
-				{
-					await connection.DisposeAsync();
-				}
-
-				throw;
-			}
+			var dispatcher = Dispatcher.Create(_registrations.ToList(), _serializer, _configuration, _loggerFactory);
+			await dispatcher.StartAsync(cancellationToken);
+			return dispatcher;
 		}
 
 		/// <summary>
@@ -178,18 +154,5 @@ namespace DouglasMQ
 		/// </summary>
 		public Task<IConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
 			=> ConnectionFactoryBuilder.CreateConnectionAsync(_configuration, purpose: null, cancellationToken);
-
-		private List<Consumer> BuildConsumers(IConnection connection)
-		{
-			return _handlers
-				.Select(h => Consumer.Create(
-					connection,
-					_serializer,
-					_loggerFactory.CreateLogger<Consumer>(),
-					_configuration,
-					h.Attribute,
-					h.Handler))
-				.ToList();
-		}
 	}
 }

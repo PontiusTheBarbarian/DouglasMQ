@@ -57,12 +57,21 @@
 
 ### Internal Implementation (opaque to callers)
 
+Both front-ends, `DouglasMQBuilder` and `ServiceCollectionExtensions`, produce only a list of `HandlerRegistration`s. Everything after that is shared, so the two behave identically.
+
 | Type | Purpose |
 |------|---------|
-| `Consumer` | Owns one `IChannel`, declares topology, handles retry/ack/nack |
-| `Dispatcher` | `IHostedService` that starts/stops consumers and manages the DLX topology |
+| `HandlerRegistration` | One consumer to start: the `[Handler]` binding plus a `HandlerInvoker` |
+| `HandlerInvoker` | Strongly-typed call into `IHandler<T>.HandleAsync`, optionally in a new DI scope per message |
+| `Dispatcher` | Opens the consumer connection on start, declares the DLX, starts one `Consumer` per registration, and releases everything if startup fails. An `IHostedService` under DI; returned directly by `StartConsumersAsync` |
+| `Consumer` | Transport adapter: owns one `IChannel`, applies QoS, and acks/nacks according to the `DeliveryProcessor`'s outcome |
+| `DeliveryProcessor` | Body in, `DeliveryOutcome` (`Ack` / `DeadLetter` / `Abandon`) out: deserializes, invokes, retries. No RabbitMQ types |
+| `RetryPolicy` | Retry count and capped exponential backoff |
+| `Topology` | The only place exchanges, queues and bindings are declared, including the `dlx.*` names |
+| `MessageRoute<T>` | `[Message]` routing data, resolved once per message type |
+| `ConnectionFactoryBuilder` | Turns `Configuration` into a RabbitMQ connection (TLS, client name) |
 
-Keeping `Consumer` and `Dispatcher` internal means their internals can be refactored without breaking any caller.
+Keeping these types internal means their internals can be refactored without breaking any caller.
 
 ## RabbitMQ Topology
 

@@ -1,3 +1,5 @@
+using System;
+using System.ComponentModel;
 using System.Net.Security;
 using System.Reflection;
 using RabbitMQ.Client;
@@ -55,12 +57,24 @@ namespace DouglasMQ
 		/// <summary>
 		/// Optional Base64-encoded client certificate for mutual TLS. Accepts PKCS#12 (.pfx/.p12,
 		/// including the private key — use <see cref="SslCertificatePassword"/> if it is protected)
-		/// or a DER/PEM certificate. Despite the name, this is the certificate itself, not a thumbprint.
+		/// or a DER/PEM certificate.
 		/// </summary>
-		public string? SslCertificateThumbprint { get; set; }
+		public string? SslClientCertificate { get; set; }
 
 		/// <summary>
-		/// Password for a PKCS#12 client certificate supplied via <see cref="SslCertificateThumbprint"/>.
+		/// Former name of <see cref="SslClientCertificate"/>; reads and writes the same value.
+		/// Despite the name it was never a thumbprint but the Base64-encoded certificate itself.
+		/// </summary>
+		[Obsolete("Use SslClientCertificate. This property holds the Base64-encoded certificate, not a thumbprint.")]
+		[EditorBrowsable(EditorBrowsableState.Never)]
+		public string? SslCertificateThumbprint
+		{
+			get => SslClientCertificate;
+			set => SslClientCertificate = value;
+		}
+
+		/// <summary>
+		/// Password for a PKCS#12 client certificate supplied via <see cref="SslClientCertificate"/>.
 		/// </summary>
 		public string? SslCertificatePassword { get; set; }
 

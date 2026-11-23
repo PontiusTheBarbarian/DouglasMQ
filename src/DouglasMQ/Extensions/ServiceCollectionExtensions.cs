@@ -1,15 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
-using System.Threading;
 using DouglasMQ.Messages;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
-using RabbitMQ.Client;
 
 namespace DouglasMQ
 {
@@ -136,32 +133,35 @@ namespace DouglasMQ
 			=> services.AddSingleton(typeof(ISerializer), serializer);
 
 		private static IServiceCollection AddDouglasMQ(this IServiceCollection services,
-			Configuration configuration) => services
+			Configuration configuration)
+		{
+			services
 				.AddSingleton(configuration)
 				// Default serializer unless the app registered its own (before or after this call:
 				// AddSerializer uses AddSingleton, and the last registration wins).
 				.TryAddSingletonFluent<ISerializer, SystemTextJsonSerializer>()
-				// The consumer connection, owned and closed by the hosted Dispatcher. Resolved when the
-				// host constructs the Dispatcher.
-				.AddSingleton<IConnection>(_ =>
-					ConnectionFactoryBuilder
-						.CreateConnectionAsync(configuration, ConnectionFactoryBuilder.ConsumerSuffix, CancellationToken.None)
-						.GetAwaiter()
-						.GetResult())
-				.AddSingleton<List<Consumer>>(provider => CreateConsumers(services, provider, configuration))
+				.AddSingleton<IReadOnlyList<HandlerRegistration>>(provider => CreateRegistrations(services, provider))
 				// The publisher gets its own lazily-opened connection rather than sharing the consumer
 				// connection, so it keeps working while the host is stopping (when the Dispatcher closes
 				// the consumer connection) and resolving it never blocks. The container disposes it.
-				.AddSingleton<IPublisher>(provider => Publisher.WithLazyConnection(
-					cancellationToken => ConnectionFactoryBuilder.CreateConnectionAsync(configuration, ConnectionFactoryBuilder.PublisherSuffix, cancellationToken),
+				.AddSingleton<IPublisher>(provider => Publisher.Create(
+					configuration,
 					provider.GetRequiredService<ISerializer>(),
-					provider.GetRequiredService<ILogger<Publisher>>(),
-					configuration))
-				.AddHostedService<Dispatcher>();
+					provider.GetRequiredService<ILogger<Publisher>>()))
+				// The Dispatcher opens (and owns) the consumer connection when the host starts it, so
+				// building the container never blocks on network I/O.
+				.AddHostedService(provider => Dispatcher.Create(
+					provider.GetRequiredService<IReadOnlyList<HandlerRegistration>>(),
+					provider.GetRequiredService<ISerializer>(),
+					configuration,
+					provider.GetRequiredService<ILoggerFactory>()));
+
+			return services;
+		}
 
 		/// <summary>
-		/// Builds one consumer per registered <see cref="IHandler{TMessage}"/> — including factory and
-		/// instance registrations, and several handlers for the same message type.
+		/// Builds one <see cref="HandlerRegistration"/> per registered <see cref="IHandler{TMessage}"/> —
+		/// including factory and instance registrations, and several handlers for the same message type.
 		/// </summary>
 		/// <remarks>
 		/// Singleton handlers are resolved once and reused for every message. Scoped and transient
@@ -170,11 +170,8 @@ namespace DouglasMQ
 		/// a new handler instance created in it. Each one is also created once here, so a handler that
 		/// cannot be constructed fails at startup rather than on its first message.
 		/// </remarks>
-		private static List<Consumer> CreateConsumers(IServiceCollection services, IServiceProvider provider, Configuration configuration)
+		private static List<HandlerRegistration> CreateRegistrations(IServiceCollection services, IServiceProvider provider)
 		{
-			var connection = provider.GetRequiredService<IConnection>();
-			var serializer = provider.GetRequiredService<ISerializer>();
-			var logger = provider.GetRequiredService<ILogger<Consumer>>();
 			var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
 
 			// Keyed descriptors are skipped: they are not part of GetServices, and reading
@@ -183,7 +180,7 @@ namespace DouglasMQ
 				.Where(d => !d.IsKeyedService && IsClosedHandlerInterface(d.ServiceType))
 				.GroupBy(d => d.ServiceType);
 
-			var consumers = new List<Consumer>();
+			var registrations = new List<HandlerRegistration>();
 			foreach (var group in handlerDescriptors)
 			{
 				var serviceType = group.Key;
@@ -213,7 +210,7 @@ namespace DouglasMQ
 							invoker = HandlerInvoker.CreateScoped(scopeFactory, handlerType, messageType, activate);
 						}
 
-						consumers.Add(Consumer.Create(connection, serializer, logger, configuration, GetHandlerAttribute(serviceType, invoker), invoker));
+						registrations.Add(HandlerRegistration.For(invoker));
 					}
 				}
 				finally
@@ -223,7 +220,7 @@ namespace DouglasMQ
 				}
 			}
 
-			return consumers;
+			return registrations;
 		}
 
 		/// <summary>
@@ -269,14 +266,6 @@ namespace DouglasMQ
 			HandlerInvoker.DisposeHandlerAsync(handler).AsTask().GetAwaiter().GetResult();
 
 			return handlerType;
-		}
-
-		private static HandlerAttribute GetHandlerAttribute(Type serviceType, HandlerInvoker invoker)
-		{
-			return invoker.HandlerType.GetCustomAttribute<HandlerAttribute>()
-				?? throw new InvalidOperationException(
-					$"Handler '{invoker.HandlerName}' is registered as {serviceType.Name} but is not decorated with " +
-					$"[{nameof(HandlerAttribute)}], so DouglasMQ does not know which queue it consumes.");
 		}
 
 		private static IServiceCollection TryAddSingletonFluent<TService, TImplementation>(this IServiceCollection services)

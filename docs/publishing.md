@@ -58,6 +58,14 @@ await publisher.SendAsync(new ChargeCustomer
 });
 ```
 
+## Cancellation
+
+Both methods take an optional `CancellationToken`. It cancels opening the connection or channel (on the first publish, or after the channel has been replaced) and waiting for a publisher confirm:
+
+```csharp
+await publisher.PublishAsync(new PaymentProcessed { /* ... */ }, cancellationToken);
+```
+
 ## Publisher confirms
 
 Publisher confirms cause `PublishAsync`/`SendAsync` to wait until the broker has persisted the message before returning. Enable this when message loss is unacceptable (e.g. financial transactions):

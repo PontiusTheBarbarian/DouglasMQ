@@ -75,7 +75,7 @@ namespace DouglasMQ.Unit.Tests
 			var factory = ConnectionFactoryBuilder.Create(new Configuration
 			{
 				UseSsl = true,
-				SslCertificateThumbprint = Convert.ToBase64String(pfx),
+				SslClientCertificate = Convert.ToBase64String(pfx),
 				SslCertificatePassword = "p@ss",
 			});
 
@@ -89,10 +89,20 @@ namespace DouglasMQ.Unit.Tests
 			var ex = Assert.Throws<ArgumentException>(() => ConnectionFactoryBuilder.Create(new Configuration
 			{
 				UseSsl = true,
-				SslCertificateThumbprint = "not base64!",
+				SslClientCertificate = "not base64!",
 			}));
 
-			Assert.Contains(nameof(Configuration.SslCertificateThumbprint), ex.Message);
+			Assert.Contains(nameof(Configuration.SslClientCertificate), ex.Message);
+		}
+
+		[Fact]
+		public void ObsoleteThumbprintProperty_ForwardsToSslClientCertificate()
+		{
+#pragma warning disable CS0618 // The old name must keep working for existing configuration files.
+			var configuration = new Configuration { SslCertificateThumbprint = "abc" };
+			Assert.Equal("abc", configuration.SslClientCertificate);
+			Assert.Equal("abc", configuration.SslCertificateThumbprint);
+#pragma warning restore CS0618
 		}
 	}
 }

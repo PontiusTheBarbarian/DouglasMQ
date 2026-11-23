@@ -4,8 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.DependencyInjection;
-using Moq;
-using RabbitMQ.Client;
+using Microsoft.Extensions.Hosting;
 using Xunit;
 
 namespace DouglasMQ.Unit.Tests
@@ -13,7 +12,8 @@ namespace DouglasMQ.Unit.Tests
 	public class ServiceRegistrationTests
 	{
 		/// <summary>
-		/// Registers DouglasMQ with a mocked consumer connection so no broker is needed.
+		/// Registers DouglasMQ. Nothing connects to a broker until the hosted Dispatcher is started,
+		/// so these tests need none.
 		/// </summary>
 		private static ServiceCollection CreateServices(Action<IServiceCollection> registerHandlers)
 		{
@@ -21,12 +21,11 @@ namespace DouglasMQ.Unit.Tests
 			services.AddLogging();
 			services.AddSingleton<ISerializer, Serializer>();
 			services.AddDouglasMQ((_, s) => registerHandlers(s));
-			services.AddSingleton(new Mock<IConnection>().Object); // overrides the real connection
 			return services;
 		}
 
-		private static List<Consumer> ResolveConsumers(ServiceCollection services) =>
-			services.BuildServiceProvider().GetRequiredService<List<Consumer>>();
+		private static IReadOnlyList<HandlerRegistration> ResolveConsumers(ServiceCollection services) =>
+			services.BuildServiceProvider().GetRequiredService<IReadOnlyList<HandlerRegistration>>();
 
 		[Fact]
 		public void TwoHandlersForSameMessageType_EachGetTheirOwnConsumer()
@@ -42,7 +41,7 @@ namespace DouglasMQ.Unit.Tests
 
 			Assert.Equal(
 				new[] { (nameof(QueueAHandler), "di.queue.a"), (nameof(QueueBHandler), "di.queue.b") },
-				consumers.Select(c => (c.HandlerName, c.QueueName)).OrderBy(x => x.QueueName));
+				consumers.Select(c => (c.Invoker.HandlerName, c.Binding.QueueName)).OrderBy(x => x.QueueName));
 		}
 
 		[Fact]
@@ -57,7 +56,7 @@ namespace DouglasMQ.Unit.Tests
 
 			var consumers = ResolveConsumers(services);
 
-			Assert.Equal(new[] { "di.queue.a", "di.queue.b" }, consumers.Select(c => c.QueueName).OrderBy(q => q));
+			Assert.Equal(new[] { "di.queue.a", "di.queue.b" }, consumers.Select(c => c.Binding.QueueName).OrderBy(q => q));
 		}
 
 		[Fact]
@@ -71,7 +70,7 @@ namespace DouglasMQ.Unit.Tests
 			});
 
 			var consumer = Assert.Single(ResolveConsumers(services));
-			Assert.Equal("di.queue.b", consumer.QueueName);
+			Assert.Equal("di.queue.b", consumer.Binding.QueueName);
 		}
 
 		[Fact]
@@ -106,6 +105,18 @@ namespace DouglasMQ.Unit.Tests
 			var publisher = services.BuildServiceProvider().GetRequiredService<IPublisher>();
 
 			Assert.IsType<Publisher>(publisher);
+		}
+
+		[Fact]
+		public void HostedDispatcher_IsResolvableWithoutConnecting()
+		{
+			// The consumer connection is opened when the host starts the Dispatcher, not while the
+			// container builds it (which used to block on network I/O).
+			var services = CreateServices(s => s.AddConsumer<DiMessage, QueueAHandler>());
+
+			var hosted = services.BuildServiceProvider().GetServices<IHostedService>();
+
+			Assert.IsType<Dispatcher>(Assert.Single(hosted));
 		}
 
 		[Fact]

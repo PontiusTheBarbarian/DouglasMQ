@@ -1,6 +1,4 @@
 using System;
-using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using DouglasMQ.Messages;
@@ -16,7 +14,7 @@ namespace DouglasMQ
 	/// </summary>
 	public sealed class Publisher : IPublisher, IAsyncDisposable
 	{
-		private readonly Func<CancellationToken, Task<IConnection>>? _connectionFactory;
+		private readonly Func<CancellationToken, Task<IConnection>> _connectionFactory;
 		private readonly bool _ownsConnection;
 		private readonly ISerializer _serializer;
 		private readonly ILogger<Publisher> _logger;
@@ -31,16 +29,22 @@ namespace DouglasMQ
 		/// the caller. Disposing the publisher closes its channel but leaves the connection open.
 		/// </summary>
 		public Publisher(IConnection connection, ISerializer serializer, ILogger<Publisher> logger, Configuration configuration)
-			: this(connection ?? throw new ArgumentNullException(nameof(connection)), ownsConnection: false, serializer, logger, configuration)
+			: this(ExistingConnection(connection ?? throw new ArgumentNullException(nameof(connection))), ownsConnection: false, serializer, logger, configuration)
 		{
 		}
 
 		/// <summary>
-		/// Creates a publisher over an existing connection, optionally taking ownership of it.
+		/// Creates a publisher that obtains its connection from <paramref name="connectionFactory"/> on
+		/// first use (retrying on the next publish if that fails).
 		/// </summary>
-		internal Publisher(IConnection connection, bool ownsConnection, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
+		/// <param name="connectionFactory">Supplies the connection.</param>
+		/// <param name="ownsConnection">Whether disposing the publisher also closes the connection.</param>
+		/// <param name="serializer">Serializes message bodies.</param>
+		/// <param name="logger">Logger for operational events.</param>
+		/// <param name="configuration">Supplies <see cref="Configuration.PublisherConfirms"/>.</param>
+		internal Publisher(Func<CancellationToken, Task<IConnection>> connectionFactory, bool ownsConnection, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
 		{
-			_connection = connection ?? throw new ArgumentNullException(nameof(connection));
+			_connectionFactory = connectionFactory ?? throw new ArgumentNullException(nameof(connectionFactory));
 			_ownsConnection = ownsConnection;
 			_serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
 			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -48,82 +52,64 @@ namespace DouglasMQ
 		}
 
 		/// <summary>
-		/// Creates a publisher that opens (and owns) its own connection on first publish. Used by the
-		/// DI registration so resolving <see cref="IPublisher"/> never blocks on network I/O, and so
-		/// publishing is unaffected when the hosted consumers stop.
+		/// Creates a publisher that opens (and owns) its own connection to the broker described by
+		/// <paramref name="configuration"/>. Nothing touches the network until the first publish, or
+		/// <see cref="ConnectAsync"/>.
 		/// </summary>
-		internal static Publisher WithLazyConnection(Func<CancellationToken, Task<IConnection>> connectionFactory, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
-			=> new Publisher(connectionFactory, serializer, logger, configuration);
+		internal static Publisher Create(Configuration configuration, ISerializer serializer, ILogger<Publisher> logger)
+			=> new(
+				cancellationToken => ConnectionFactoryBuilder.CreateConnectionAsync(configuration, ConnectionFactoryBuilder.PublisherSuffix, cancellationToken),
+				ownsConnection: true,
+				serializer,
+				logger,
+				configuration);
 
-		private Publisher(Func<CancellationToken, Task<IConnection>> connectionFactory, ISerializer serializer, ILogger<Publisher> logger, Configuration? configuration)
-		{
-			_connectionFactory = connectionFactory ?? throw new ArgumentNullException(nameof(connectionFactory));
-			_ownsConnection = true;
-			_serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
-			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
-			_publisherConfirms = configuration?.PublisherConfirms ?? false;
-		}
+		private static Func<CancellationToken, Task<IConnection>> ExistingConnection(IConnection connection)
+			=> _ => Task.FromResult(connection);
 
 		/// <summary>
 		/// Publishes an event to the message broker.
 		/// </summary>
 		/// <typeparam name="TEvent">The type of the event to be published. Must implement <see cref="IEvent"/>.</typeparam>
 		/// <param name="event">The event to be published.</param>
+		/// <param name="cancellationToken">Cancels opening the connection or channel, and waiting for a publisher confirm.</param>
 		/// <exception cref="ArgumentNullException">Thrown when <paramref name="event"/> is <c>null</c>.</exception>
 		/// <exception cref="InvalidOperationException">Thrown when the message type does not have a <see cref="MessageAttribute"/>.</exception>
-		public async ValueTask PublishAsync<TEvent>(TEvent @event)
+		public ValueTask PublishAsync<TEvent>(TEvent @event, CancellationToken cancellationToken = default)
 			where TEvent : class, IEvent
-		{
-			if (@event is null)
-			{
-				throw new ArgumentNullException(nameof(@event));
-			}
-
-			var routingInformation = GetMessageAttribute<TEvent>();
-			await PublishCoreAsync<TEvent>(@event, routingInformation.ExchangeName, routingInformation.RoutingKey);
-		}
+			=> PublishCoreAsync(@event ?? throw new ArgumentNullException(nameof(@event)), cancellationToken);
 
 		/// <summary>
 		/// Sends a command to the message broker.
 		/// </summary>
 		/// <typeparam name="TCommand">The type of the command to be sent. Must implement <see cref="ICommand"/>.</typeparam>
 		/// <param name="command">The command to be sent.</param>
+		/// <param name="cancellationToken">Cancels opening the connection or channel, and waiting for a publisher confirm.</param>
 		/// <exception cref="ArgumentNullException">Thrown when <paramref name="command"/> is <c>null</c>.</exception>
 		/// <exception cref="InvalidOperationException">Thrown when the message type does not have a <see cref="MessageAttribute"/>.</exception>
-		public async ValueTask SendAsync<TCommand>(TCommand command)
+		public ValueTask SendAsync<TCommand>(TCommand command, CancellationToken cancellationToken = default)
 			where TCommand : class, ICommand
-		{
-			if (command is null)
-			{
-				throw new ArgumentNullException(nameof(command));
-			}
+			=> PublishCoreAsync(command ?? throw new ArgumentNullException(nameof(command)), cancellationToken);
 
-			var routingInformation = GetMessageAttribute<TCommand>();
-			await PublishCoreAsync<TCommand>(command, routingInformation.ExchangeName, routingInformation.RoutingKey);
+		/// <summary>
+		/// Opens the connection and channel now rather than on the first publish, so an unreachable
+		/// broker or bad credentials surface immediately.
+		/// </summary>
+		internal async Task ConnectAsync(CancellationToken cancellationToken)
+		{
+			ObjectDisposedException.ThrowIf(_disposed, this);
+			await GetOrCreateChannelAsync(cancellationToken);
 		}
 
-		private static MessageAttribute GetMessageAttribute<TMessage>()
-		{
-			var attr = Attribute.GetCustomAttributes(typeof(TMessage))
-				.OfType<MessageAttribute>()
-				.SingleOrDefault();
-
-			if (attr is null)
-			{
-				throw new InvalidOperationException(
-					$"Message type '{typeof(TMessage).Name}' is missing the [Message] attribute.");
-			}
-
-			return attr;
-		}
-
-		private async ValueTask PublishCoreAsync<TMessage>(TMessage message, string exchangeName, string routingKey)
+		private async ValueTask PublishCoreAsync<TMessage>(TMessage message, CancellationToken cancellationToken)
 			where TMessage : class, IMessage
 		{
 			ObjectDisposedException.ThrowIf(_disposed, this);
 
-			var channel = await GetOrCreateChannelAsync();
-			var body = Encoding.UTF8.GetBytes(_serializer.Serialize<TMessage>(message));
+			// Resolve the route before touching the network, so a missing [Message] fails fast.
+			var route = MessageRoute<TMessage>.Require();
+			var channel = await GetOrCreateChannelAsync(cancellationToken);
+			var body = _serializer.SerializeToBytes(message);
 
 			// Persistent (delivery mode 2) so messages survive a broker restart when routed to
 			// durable queues. Identity/correlation are surfaced as standard AMQP properties so
@@ -133,22 +119,23 @@ namespace DouglasMQ
 				Persistent = true,
 				MessageId = message.MessageId.ToString(),
 				CorrelationId = message.TraceId.ToString(),
-				Type = typeof(TMessage).FullName,
+				Type = MessageRoute<TMessage>.TypeName,
 				Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
 			};
 
 			_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
-				typeof(TMessage).Name, message.MessageId, exchangeName, routingKey);
+				typeof(TMessage).Name, message.MessageId, route.ExchangeName, route.RoutingKey);
 
 			await channel.BasicPublishAsync(
-				exchange: exchangeName,
-				routingKey: routingKey,
+				exchange: route.ExchangeName,
+				routingKey: route.RoutingKey,
 				mandatory: false,
 				basicProperties: properties,
-				body: body);
+				body: body,
+				cancellationToken: cancellationToken);
 		}
 
-		private async ValueTask<IChannel> GetOrCreateChannelAsync()
+		private async ValueTask<IChannel> GetOrCreateChannelAsync(CancellationToken cancellationToken)
 		{
 			var channel = _channel;
 			if (channel is { IsOpen: true })
@@ -156,7 +143,7 @@ namespace DouglasMQ
 				return channel;
 			}
 
-			await _channelLock.WaitAsync();
+			await _channelLock.WaitAsync(cancellationToken);
 			try
 			{
 				if (_channel is { IsOpen: true })
@@ -183,8 +170,8 @@ namespace DouglasMQ
 					publisherConfirmationsEnabled: _publisherConfirms,
 					publisherConfirmationTrackingEnabled: _publisherConfirms);
 
-				_connection ??= await _connectionFactory!(CancellationToken.None);
-				_channel = await _connection.CreateChannelAsync(options);
+				_connection ??= await _connectionFactory(cancellationToken);
+				_channel = await _connection.CreateChannelAsync(options, cancellationToken);
 				return _channel;
 			}
 			finally
@@ -205,40 +192,19 @@ namespace DouglasMQ
 
 			_disposed = true;
 
-			var channel = _channel;
-			if (channel is not null)
+			try
 			{
-				try
-				{
-					if (channel.IsOpen)
-					{
-						await channel.CloseAsync();
-					}
-				}
-				finally
-				{
-					await channel.DisposeAsync();
-				}
+				await AmqpResources.CloseAndDisposeAsync(_channel);
 			}
-
-			var connection = _connection;
-			if (_ownsConnection && connection is not null)
+			finally
 			{
-				try
+				if (_ownsConnection)
 				{
-					if (connection.IsOpen)
-					{
-						await connection.CloseAsync();
-					}
+					await AmqpResources.CloseAndDisposeAsync(_connection);
 				}
-				finally
-				{
-					await connection.DisposeAsync();
-				}
-			}
 
-			_channelLock.Dispose();
-			GC.SuppressFinalize(this);
+				_channelLock.Dispose();
+			}
 		}
 	}
 }

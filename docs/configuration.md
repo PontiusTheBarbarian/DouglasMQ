@@ -31,7 +31,7 @@ All settings live in the `DouglasMQ.Configuration` class. When using Microsoft D
 | `Port` | `int` | `-1` | Broker port. `-1` uses the protocol default (5672, or 5671 with TLS) |
 | `UseSsl` | `bool` | `false` | Enable TLS. The broker certificate is fully validated unless `SslAcceptablePolicyErrors` says otherwise. No client certificate is needed unless the broker requires mutual TLS |
 | `SslServerName` | `string?` | `HostName` | Name expected on the broker's certificate. Set this when connecting by IP or through a load balancer |
-| `SslCertificateThumbprint` | `string?` | `null` | Optional Base64-encoded client certificate for mutual TLS. Despite the name this is the certificate itself: PKCS#12 (`.pfx`, keeps the private key) or DER/PEM |
+| `SslClientCertificate` | `string?` | `null` | Optional Base64-encoded client certificate for mutual TLS: PKCS#12 (`.pfx`, keeps the private key) or DER/PEM. Formerly `SslCertificateThumbprint`, which still works (and still binds from configuration) but is obsolete |
 | `SslCertificatePassword` | `string?` | `null` | Password for a PKCS#12 client certificate |
 | `SslAcceptablePolicyErrors` | `SslPolicyErrors` | `None` | Certificate errors to tolerate. Leave as `None` in production; relaxing it disables man-in-the-middle protection |
 | `PrefetchCount` | `ushort` | `10` | Maximum number of unacknowledged messages delivered to each consumer channel at once. Lower values reduce memory pressure; higher values increase throughput. |
@@ -71,7 +71,7 @@ The broker's certificate is validated against `SslServerName` (defaulting to `Ho
 For mutual TLS, also supply a client certificate. Use a PKCS#12 file so the private key is included:
 
 ```csharp
-c.SslCertificateThumbprint = Convert.ToBase64String(File.ReadAllBytes("client.pfx"));
+c.SslClientCertificate = Convert.ToBase64String(File.ReadAllBytes("client.pfx"));
 c.SslCertificatePassword = "pfx-password";
 ```
 
