@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
@@ -42,12 +43,17 @@ namespace DouglasMQ.Unit.Tests
 				s.AddSingleton<ISerializer, SystemTextJsonSerializer>();
 				register(s);
 			});
-			services.AddSingleton(new Mock<IConnection>().Object);
 
 			// Scope validation on, as in the Development environment: a scoped dependency captured by
 			// a handler resolved from the root provider would throw here.
 			var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
-			return Assert.Single(provider.GetRequiredService<List<Consumer>>());
+			var registration = Assert.Single(provider.GetRequiredService<IReadOnlyList<HandlerRegistration>>());
+			return Consumer.Create(
+				new Mock<IConnection>().Object,
+				registration,
+				provider.GetRequiredService<ISerializer>(),
+				provider.GetRequiredService<Configuration>(),
+				NullLogger.Instance);
 		}
 
 		private Task DeliverAsync(Consumer consumer) =>

@@ -51,11 +51,11 @@ namespace DouglasMQ
 					AcceptablePolicyErrors = configuration.SslAcceptablePolicyErrors,
 				};
 
-				if (!string.IsNullOrWhiteSpace(configuration.SslCertificateThumbprint))
+				if (!string.IsNullOrWhiteSpace(configuration.SslClientCertificate))
 				{
 					factory.Ssl.Certs = new X509CertificateCollection
 					{
-						LoadClientCertificate(configuration.SslCertificateThumbprint, configuration.SslCertificatePassword),
+						LoadClientCertificate(configuration.SslClientCertificate, configuration.SslCertificatePassword),
 					};
 				}
 			}
@@ -83,7 +83,7 @@ namespace DouglasMQ
 			}
 			catch (FormatException ex)
 			{
-				throw new ArgumentException($"{nameof(Configuration.SslCertificateThumbprint)} must be a Base64-encoded certificate.", ex);
+				throw new ArgumentException($"{nameof(Configuration.SslClientCertificate)} must be a Base64-encoded certificate.", ex);
 			}
 
 			// A client certificate is only useful for mutual TLS if it carries its private key,

@@ -1,4 +1,5 @@
-﻿using System.Threading.Tasks;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace DouglasMQ
 {
@@ -12,9 +13,13 @@ namespace DouglasMQ
 		/// </summary>
 		/// <typeparam name="TEvent">The type of the event to be published. Must implement <see cref="IEvent"/>.</typeparam>
 		/// <param name="event">The event to be published.</param>
+		/// <param name="cancellationToken">
+		/// Cancels opening the connection or channel, and waiting for a publisher confirm when
+		/// <see cref="Configuration.PublisherConfirms"/> is enabled.
+		/// </param>
 		/// <returns>A <see cref="ValueTask"/> representing the asynchronous operation.</returns>
 		/// <exception cref="System.ArgumentNullException">Thrown when <paramref name="event"/> is <c>null</c>.</exception>
-		ValueTask PublishAsync<TEvent>(TEvent @event)
+		ValueTask PublishAsync<TEvent>(TEvent @event, CancellationToken cancellationToken = default)
 			where TEvent : class, IEvent;
 
 		/// <summary>
@@ -22,9 +27,13 @@ namespace DouglasMQ
 		/// </summary>
 		/// <typeparam name="TCommand">The type of the command to be sent. Must implement <see cref="ICommand"/>.</typeparam>
 		/// <param name="command">The command to be sent.</param>
+		/// <param name="cancellationToken">
+		/// Cancels opening the connection or channel, and waiting for a publisher confirm when
+		/// <see cref="Configuration.PublisherConfirms"/> is enabled.
+		/// </param>
 		/// <returns>A <see cref="ValueTask"/> representing the asynchronous operation.</returns>
 		/// <exception cref="System.ArgumentNullException">Thrown when <paramref name="command"/> is <c>null</c>.</exception>
-		ValueTask SendAsync<TCommand>(TCommand command)
+		ValueTask SendAsync<TCommand>(TCommand command, CancellationToken cancellationToken = default)
 			where TCommand : class, ICommand;
 	}
 }

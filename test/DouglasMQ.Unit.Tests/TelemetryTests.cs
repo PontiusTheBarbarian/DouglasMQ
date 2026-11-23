@@ -218,6 +218,28 @@ namespace DouglasMQ.Unit.Tests
 		}
 
 		[Fact]
+		public async Task ProcessDelivery_NestsOneAttemptSpanPerHandlerAttempt()
+		{
+			var handler = new TelemetryHandler { FailuresBeforeSuccess = 1 };
+			var (consumer, channel, _) = CreateConsumer(handler, retryCount: 2);
+
+			await consumer.HandleDeliveryAsync(channel.Object, Delivery());
+
+			var delivery = Assert.Single(_activities, a => a.OperationName == $"process {Queue}");
+			var attempts = _activities.Where(a => a.OperationName == $"{Queue} process").ToList();
+			Assert.Equal(2, attempts.Count);
+			Assert.All(attempts, a =>
+			{
+				Assert.Equal(delivery.SpanId, a.ParentSpanId);
+				Assert.Equal(delivery.TraceId, a.TraceId);
+				Assert.Equal(ActivityKind.Consumer, a.Kind);
+				Assert.Equal(Queue, a.GetTagItem("messaging.consumer.group.name"));
+			});
+			Assert.Equal(ActivityStatusCode.Error, attempts[0].Status);
+			Assert.Equal(ActivityStatusCode.Unset, attempts[1].Status);
+		}
+
+		[Fact]
 		public async Task ProcessDelivery_MarksSpanAsErrorWhenDeadLettered()
 		{
 			var handler = new TelemetryHandler { FailuresBeforeSuccess = int.MaxValue };
@@ -272,16 +294,15 @@ namespace DouglasMQ.Unit.Tests
 		{
 			var channel = new Mock<IChannel>();
 			var connection = new Mock<IConnection>();
+			channel.SetupGet(c => c.IsOpen).Returns(true);
 			var configuration = new Configuration { RetryCount = retryCount, RetryDelayMs = 1 };
-			var attribute = (HandlerAttribute)Attribute.GetCustomAttribute(typeof(TelemetryHandler), typeof(HandlerAttribute))!;
 
 			var consumer = Consumer.Create(
 				connection.Object,
+				HandlerRegistration.For(HandlerInvoker.Create(handler)),
 				serializer ?? new JsonSerializer(),
-				NullLogger<Consumer>.Instance,
 				configuration,
-				attribute,
-				handler);
+				NullLogger<Consumer>.Instance);
 
 			return (consumer, channel, connection);
 		}

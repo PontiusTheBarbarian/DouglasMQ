@@ -96,7 +96,7 @@ To customise it, pass your own `JsonSerializerOptions`:
 .WithSerializer(new SystemTextJsonSerializer(new JsonSerializerOptions { /* converters, policies */ }))
 ```
 
-To use another library (Newtonsoft.Json, MessagePack, …), implement `DouglasMQ.Serialization.ISerializer` and register it with `WithSerializer(...)`, or with `AddSerializer(typeof(MySerializer))` in DI.
+To use another library (Newtonsoft.Json, MessagePack, …), implement `DouglasMQ.Serialization.ISerializer` and register it with `WithSerializer(...)`, or with `AddSerializer(typeof(MySerializer))` in DI. A text serializer only needs `Serialize` and `Deserialize`; DouglasMQ UTF-8 encodes around them. Override `SerializeToBytes` and `DeserializeFromBytes` as well to skip the intermediate string or to use a binary format.
 
 ## Next Steps
 

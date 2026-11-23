@@ -57,12 +57,21 @@
 
 ### Internal Implementation (opaque to callers)
 
+Both front-ends, `DouglasMQBuilder` and `ServiceCollectionExtensions`, produce only a list of `HandlerRegistration`s. Everything after that is shared, so the two behave identically.
+
 | Type | Purpose |
 |------|---------|
-| `Consumer` | Owns one `IChannel`, declares topology, handles retry/ack/nack |
-| `Dispatcher` | `IHostedService` that starts/stops consumers and manages the DLX topology |
+| `HandlerRegistration` | One consumer to start: the `[Handler]` binding plus a `HandlerInvoker` |
+| `HandlerInvoker` | Strongly-typed call into `IHandler<T>.HandleAsync`, optionally in a new DI scope per message |
+| `Dispatcher` | Opens the consumer connection, declares the DLX, starts one `Consumer` per registration, and releases everything if an attempt fails. Under DI it is the `IHostedService` and `IDouglasMQStatus`, starting in the background with retries; `StartConsumersAsync` starts it in the foreground. Shuts down exactly once however calls overlap |
+| `Consumer` | Transport adapter: owns one `IChannel`, applies QoS, acks/nacks according to the `DeliveryProcessor`'s outcome, and stops gracefully (cancel subscription, drain in-flight handlers, close) |
+| `DeliveryProcessor` | Body in, `DeliveryOutcome` (`Ack` / `DeadLetter` / `Abandon`) out: deserializes, invokes, retries, honours `NonRetryableException`, and wraps each attempt in a span and log scope. No RabbitMQ types |
+| `RetryPolicy` | Retry count and capped exponential backoff |
+| `Topology` | The only place exchanges, queues and bindings are declared, including the `dlx.*` names |
+| `MessageRoute<T>` | `[Message]` routing data, resolved once per message type |
+| `ConnectionFactoryBuilder` | Turns `Configuration` into a RabbitMQ connection (TLS, client name) |
 
-Keeping `Consumer` and `Dispatcher` internal means their internals can be refactored without breaking any caller.
+Keeping these types internal means their internals can be refactored without breaking any caller.
 
 ## RabbitMQ Topology
 

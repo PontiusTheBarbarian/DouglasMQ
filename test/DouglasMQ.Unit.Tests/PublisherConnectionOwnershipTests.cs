@@ -27,10 +27,11 @@ namespace DouglasMQ.Unit.Tests
 		[Fact]
 		public async Task OwnedConnection_IsDisposedWithPublisher()
 		{
-			// BuildPublisherAsync hands the publisher its own connection; it used to leak.
-			var connection = new Mock<IConnection>();
-			var publisher = new Publisher(connection.Object, ownsConnection: true, new Serializer(), NullLogger<Publisher>.Instance, new Configuration());
+			// BuildPublisherAsync connects the publisher up front over its own connection; it used to leak.
+			var connection = ConnectionWithChannel();
+			var publisher = new Publisher(_ => Task.FromResult(connection.Object), ownsConnection: true, new Serializer(), NullLogger<Publisher>.Instance, new Configuration());
 
+			await publisher.ConnectAsync(CancellationToken.None);
 			await publisher.DisposeAsync();
 
 			connection.Verify(c => c.DisposeAsync(), Times.Once);
@@ -52,12 +53,13 @@ namespace DouglasMQ.Unit.Tests
 		{
 			var connection = ConnectionWithChannel();
 			var opens = 0;
-			var publisher = Publisher.WithLazyConnection(
+			var publisher = new Publisher(
 				_ =>
 				{
 					opens++;
 					return Task.FromResult(connection.Object);
 				},
+				ownsConnection: true,
 				new Serializer(),
 				NullLogger<Publisher>.Instance,
 				new Configuration());
@@ -77,10 +79,11 @@ namespace DouglasMQ.Unit.Tests
 		{
 			var connection = ConnectionWithChannel();
 			var attempts = 0;
-			var publisher = Publisher.WithLazyConnection(
+			var publisher = new Publisher(
 				_ => ++attempts == 1
 					? Task.FromException<IConnection>(new InvalidOperationException("broker down"))
 					: Task.FromResult(connection.Object),
+				ownsConnection: true,
 				new Serializer(),
 				NullLogger<Publisher>.Instance,
 				new Configuration());
@@ -89,6 +92,27 @@ namespace DouglasMQ.Unit.Tests
 			await publisher.PublishAsync(new Event());
 
 			Assert.Equal(2, attempts);
+		}
+
+		[Fact]
+		public async Task CancelledPublish_DoesNotOpenConnection()
+		{
+			var opens = 0;
+			var publisher = new Publisher(
+				_ =>
+				{
+					opens++;
+					return Task.FromResult(ConnectionWithChannel().Object);
+				},
+				ownsConnection: true,
+				new Serializer(),
+				NullLogger<Publisher>.Instance,
+				new Configuration());
+
+			await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+				publisher.PublishAsync(new Event(), new CancellationToken(canceled: true)).AsTask());
+
+			Assert.Equal(0, opens);
 		}
 
 		[Message("ownership.exchange", "ownership.key")]

@@ -36,6 +36,10 @@ Log records written while a DouglasMQ span is active, including DouglasMQ's own 
 dead-letter logs and anything your handler logs, carry that span's trace and span ID. You can
 jump from a log line straight to its trace.
 
+Around each handler attempt DouglasMQ also opens a logger scope with `MessageId` and `TraceId`.
+Loggers from the same `ILoggerFactory`, including the ones injected into your handlers, include them
+when the provider records scopes (for example `AddJsonConsole(o => o.IncludeScopes = true)`).
+
 ## Traces
 
 ### Context propagation
@@ -50,10 +54,11 @@ POST /orders                                   (ASP.NET Core)
 └─ publish sample.orders                       (DouglasMQ, Producer)
    └─ publish order.placed                     (RabbitMQ.Client, optional)
       └─ deliver order.placed                  (RabbitMQ.Client, optional)
-         └─ process sample.order-processing    (DouglasMQ, Consumer)
-            ├─ charge payment                  (your handler code)
-            └─ publish sample.shipping         (DouglasMQ, Producer)
-               └─ …
+         └─ process sample.order-processing    (DouglasMQ, Consumer: the delivery)
+            └─ sample.order-processing process (DouglasMQ, Consumer: one per handler attempt)
+               ├─ charge payment               (your handler code)
+               └─ publish sample.shipping      (DouglasMQ, Producer)
+                  └─ …
 ```
 
 If RabbitMQ.Client's `deliver` span is active and belongs to the same trace, the `process` span
@@ -104,9 +109,28 @@ Events on the span:
 A dead-lettered message sets the span status to `Error`. A message that succeeds after retries
 keeps status `Unset`, but its retry history is still visible in the events.
 
+### Span: `{queue} process` (Consumer, one per handler attempt)
+
+Each handler attempt, retries included, gets its own span as a child of the delivery's `process {queue}`
+span, so a retried message shows each attempt with its own timing and error.
+
+| Attribute | Example |
+|-----------|---------|
+| `messaging.system` | `rabbitmq` |
+| `messaging.operation.name` / `.type` | `process` / `process` |
+| `messaging.destination.name` | exchange name |
+| `messaging.rabbitmq.destination.routing_key` | routing key of the delivery |
+| `messaging.message.id` / `.conversation_id` | from the deserialized message |
+| `messaging.consumer.group.name` | queue name (also as `messaging.destination.subscription.name`) |
+| `douglasmq.handler` / `douglasmq.message.type` | `OrderPlacedHandler` / `OrderPlaced` |
+| `douglasmq.attempt` | `1` for the first attempt, `2` for the first retry, … |
+
+A failed attempt has status `Error`, an `exception` event and `error.type`. A
+`NonRetryableException` ends the delivery after that one failed attempt.
+
 ### Adding your own spans
 
-Spans you start inside `HandleAsync` automatically become children of the `process` span:
+Spans you start inside `HandleAsync` automatically become children of the attempt's `{queue} process` span:
 
 ```csharp
 private static readonly ActivitySource Source = new("Orders");

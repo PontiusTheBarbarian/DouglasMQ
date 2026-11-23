@@ -1,3 +1,7 @@
+using System.Collections.Generic;
+using DouglasMQ.Serialization;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace DouglasMQ.Unit.Tests
@@ -51,9 +55,9 @@ namespace DouglasMQ.Unit.Tests
 		}
 
 		[Fact]
-		public void Default_SslCertificateThumbprint_IsNull()
+		public void Default_SslClientCertificate_IsNull()
 		{
-			Assert.Null(new Configuration().SslCertificateThumbprint);
+			Assert.Null(new Configuration().SslClientCertificate);
 		}
 
 		[Fact]
@@ -78,6 +82,23 @@ namespace DouglasMQ.Unit.Tests
 		public void Default_PublisherConfirms_IsFalse()
 		{
 			Assert.False(new Configuration().PublisherConfirms);
+		}
+
+		[Theory]
+		[InlineData("SslClientCertificate")]
+		[InlineData("SslCertificateThumbprint")] // old key in existing appsettings files
+		public void ClientCertificate_BindsFromEitherConfigurationKey(string key)
+		{
+			var configuration = new ConfigurationBuilder()
+				.AddInMemoryCollection(new Dictionary<string, string?> { [$"DouglasMQ:{key}"] = "Y2VydA==" })
+				.Build();
+
+			var provider = new ServiceCollection()
+				.AddLogging()
+				.AddDouglasMQ(configuration, typeof(SystemTextJsonSerializer))
+				.BuildServiceProvider();
+
+			Assert.Equal("Y2VydA==", provider.GetRequiredService<Configuration>().SslClientCertificate);
 		}
 	}
 }

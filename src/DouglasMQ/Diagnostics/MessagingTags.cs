@@ -12,6 +12,7 @@ namespace DouglasMQ.Diagnostics
 		public const string OperationType = "messaging.operation.type";
 		public const string DestinationName = "messaging.destination.name";
 		public const string SubscriptionName = "messaging.destination.subscription.name";
+		public const string ConsumerGroup = "messaging.consumer.group.name";
 		public const string RoutingKey = "messaging.rabbitmq.destination.routing_key";
 		public const string DeliveryTag = "messaging.rabbitmq.message.delivery_tag";
 		public const string Redelivered = "messaging.rabbitmq.message.redelivered";

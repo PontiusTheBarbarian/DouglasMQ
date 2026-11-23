@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using DouglasMQ.Serialization;
+using Microsoft.Extensions.DependencyInjection;
 using Testcontainers.RabbitMq;
 using Xunit;
 
@@ -33,6 +34,24 @@ namespace DouglasMQ.Integration.Tests
 					c.PrefetchCount = 10;
 				})
 				.WithSerializer(new JsonSerializer());
+
+		/// <summary>
+		/// Waits until the consumers started in the background by <c>AddDouglasMQ</c> are running.
+		/// </summary>
+		public static async Task WaitForConsumersAsync(IServiceProvider services)
+		{
+			var status = services.GetRequiredService<IDouglasMQStatus>();
+			var deadline = DateTime.UtcNow.AddSeconds(15);
+			while (!status.ConsumersRunning)
+			{
+				if (DateTime.UtcNow > deadline)
+				{
+					throw new TimeoutException("DouglasMQ consumers did not start within 15 s.");
+				}
+
+				await Task.Delay(25);
+			}
+		}
 
 		public async Task InitializeAsync() => await _container.StartAsync();
 

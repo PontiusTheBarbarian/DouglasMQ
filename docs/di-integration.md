@@ -71,10 +71,11 @@ host.Run();
 | Service | Lifetime | Description |
 |---------|----------|-------------|
 | `Configuration` | Singleton | Resolved configuration values |
-| `IConnection` | Singleton | Consumer connection, opened when the host starts and closed by the `Dispatcher` on stop |
-| `List<Consumer>` | Singleton | All discovered/registered consumer instances |
 | `IPublisher` | Singleton | `Publisher` with its **own** connection, opened on first publish. It keeps working while the host stops, and the container closes it on disposal |
-| `Dispatcher` | `IHostedService` | Starts consumers on host start, stops on host stop |
+| `Dispatcher` | `IHostedService` | Opens its own consumer connection and starts one consumer per registered handler in the background once the host starts, retrying while the broker is unreachable (see [Resilience](resilience.md#starting-while-the-broker-is-unreachable)); stops them gracefully and closes the connection when it stops. Neither building the container nor starting the host touches the network |
+| `IDouglasMQStatus` | Singleton | `ConsumersRunning` tells you whether the consumers are up, e.g. for a readiness check |
+
+The consumer connection is no longer registered as an `IConnection` singleton. To use RabbitMQ directly, open a connection of your own (for example with `DouglasMQBuilder.CreateConnectionAsync`).
 
 ## Handler lifetimes and scopes
 

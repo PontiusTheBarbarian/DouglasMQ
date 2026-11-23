@@ -41,6 +41,29 @@ namespace DouglasMQ.Unit.Tests
 		}
 
 		[Fact]
+		public void ByteMembers_MatchStringMembers()
+		{
+			ISerializer serializer = _serializer;
+			var order = new Order { OrderId = "ORD-1", Quantity = 2 };
+
+			var bytes = serializer.SerializeToBytes(order);
+
+			Assert.Equal(serializer.Serialize(order), System.Text.Encoding.UTF8.GetString(bytes));
+			var result = Assert.IsType<Order>(serializer.DeserializeFromBytes(bytes, typeof(Order)));
+			Assert.Equal("ORD-1", result.OrderId);
+		}
+
+		[Fact]
+		public void StringOnlySerializer_GetsUtf8ByteMembersByDefault()
+		{
+			// Existing custom serializers that only implement the string members keep working.
+			ISerializer serializer = new StringOnlySerializer();
+
+			Assert.Equal("ünïcode"u8.ToArray(), serializer.SerializeToBytes(new Order()));
+			Assert.Equal("ünïcode", serializer.DeserializeFromBytes("ünïcode"u8, typeof(string)));
+		}
+
+		[Fact]
 		public void MalformedJson_Throws()
 		{
 			// The consumer relies on this to dead-letter poison messages.
@@ -74,6 +97,13 @@ namespace DouglasMQ.Unit.Tests
 			public string OrderId { get; set; } = string.Empty;
 
 			public int Quantity { get; set; }
+		}
+
+		private sealed class StringOnlySerializer : ISerializer
+		{
+			public string Serialize<T>(T data) => "ünïcode";
+
+			public object? Deserialize(string data, Type type) => data;
 		}
 
 		private sealed class CustomSerializer : ISerializer
