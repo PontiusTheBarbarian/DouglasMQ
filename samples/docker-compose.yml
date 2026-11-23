@@ -1,0 +1,20 @@
+# RabbitMQ for the DouglasMQ sample.
+#   docker compose -f samples/docker-compose.yml up -d
+#
+# If you don't already run Seq locally, start it too:
+#   docker compose -f samples/docker-compose.yml --profile seq up -d
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # management UI (guest / guest)
+
+  seq:
+    image: datalust/seq:latest
+    profiles: ["seq"]
+    environment:
+      ACCEPT_EULA: "Y"
+      SEQ_FIRSTRUN_NOAUTHENTICATION: "true"
+    ports:
+      - "5341:80"       # UI and ingestion, including OTLP at /ingest/otlp

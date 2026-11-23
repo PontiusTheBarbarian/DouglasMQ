@@ -112,22 +112,34 @@ namespace DouglasMQ
 			// Resolve the route before touching the network, so a missing [Message] fails fast.
 			var route = MessageRoute<TMessage>.Require();
 
-			using var activity = DouglasMQTelemetry.ActivitySource.StartActivity($"{route.ExchangeName} publish", ActivityKind.Producer);
+			var messageType = typeof(TMessage).Name;
+			using var activity = DouglasMQTelemetry.ActivitySource.StartActivity($"publish {route.ExchangeName}", ActivityKind.Producer);
 			if (activity is { IsAllDataRequested: true })
 			{
 				activity.SetTag(MessagingTags.System, MessagingTags.SystemValue);
+				activity.SetTag(MessagingTags.OperationName, "publish");
 				activity.SetTag(MessagingTags.OperationType, "send");
 				activity.SetTag(MessagingTags.DestinationName, route.ExchangeName);
 				activity.SetTag(MessagingTags.RoutingKey, route.RoutingKey);
 				activity.SetTag(MessagingTags.MessageId, message.MessageId.ToString());
 				activity.SetTag(MessagingTags.ConversationId, message.TraceId.ToString());
-				activity.SetTag(MessagingTags.MessageType, typeof(TMessage).Name);
+				activity.SetTag(MessagingTags.MessageType, messageType);
+				activity.SetTag(MessagingTags.PublisherConfirms, _publisherConfirms);
 			}
 
+			var metricTags = new TagList
+			{
+				{ MessagingTags.System, MessagingTags.SystemValue },
+				{ MessagingTags.DestinationName, route.ExchangeName },
+				{ MessagingTags.MessageType, messageType },
+			};
+
+			var startTimestamp = Stopwatch.GetTimestamp();
 			try
 			{
 				var channel = await GetOrCreateChannelAsync(cancellationToken);
 				var body = _serializer.SerializeToBytes(message);
+				activity?.SetTag(MessagingTags.BodySize, body.Length);
 
 				// W3C trace context (traceparent/tracestate/baggage) travels in the headers, so the
 				// consumer's process span joins the publisher's trace.
@@ -144,11 +156,11 @@ namespace DouglasMQ
 					CorrelationId = message.TraceId.ToString(),
 					Type = MessageRoute<TMessage>.TypeName,
 					Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
-					Headers = headers.Count > 0 ? headers : null,
+					Headers = headers,
 				};
 
 				_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
-					typeof(TMessage).Name, message.MessageId, route.ExchangeName, route.RoutingKey);
+					messageType, message.MessageId, route.ExchangeName, route.RoutingKey);
 
 				await channel.BasicPublishAsync(
 					exchange: route.ExchangeName,
@@ -157,13 +169,21 @@ namespace DouglasMQ
 					basicProperties: properties,
 					body: body,
 					cancellationToken: cancellationToken);
+
+				DouglasMQTelemetry.MessagesPublished.Add(1, metricTags);
 			}
-			catch (Exception ex) when (activity is not null)
+			catch (Exception ex)
 			{
-				activity.SetStatus(ActivityStatusCode.Error, ex.Message);
-				activity.SetTag(MessagingTags.ErrorType, ex.GetType().FullName);
-				activity.AddException(ex);
+				var errorType = ex.GetType().FullName;
+				metricTags.Add(MessagingTags.ErrorType, errorType);
+				activity?.SetTag(MessagingTags.ErrorType, errorType);
+				activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+				activity?.AddException(ex);
 				throw;
+			}
+			finally
+			{
+				DouglasMQTelemetry.PublishDuration.Record(Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, metricTags);
 			}
 		}
 

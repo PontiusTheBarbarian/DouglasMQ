@@ -65,7 +65,7 @@ await ((IAsyncDisposable)publisher).DisposeAsync();
 | [Publishing](docs/publishing.md) | Events, commands, and publisher confirms |
 | [Consuming](docs/consuming.md) | Handlers, routing, and DI injection |
 | [Resilience](docs/resilience.md) | Retry, non-retryable failures, DLX, start-up while the broker is down, graceful shutdown |
-| [Observability](docs/observability.md) | Tracing spans and per-message log context |
+| [Observability](docs/observability.md) | OpenTelemetry traces, metrics, and log correlation |
 | [Microsoft DI Integration](docs/di-integration.md) | `AddDouglasMQ` extension methods |
 | [Without DI](docs/without-di.md) | `DouglasMQBuilder` fluent API |
 | [Releasing to NuGet](docs/releasing.md) | Versioning, Source Link, and publish checklist |

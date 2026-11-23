@@ -1,12 +1,14 @@
-using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Linq;
 using System.Text;
 
 namespace DouglasMQ.Diagnostics
 {
 	/// <summary>
-	/// The activity source DouglasMQ traces through, plus trace-context propagation through AMQP headers.
+	/// Holds the activity source, meter and instruments DouglasMQ records telemetry with, plus
+	/// helpers for propagating trace context through AMQP message headers.
 	/// </summary>
 	internal static class DouglasMQTelemetry
 	{
@@ -14,9 +16,50 @@ namespace DouglasMQ.Diagnostics
 
 		public static readonly ActivitySource ActivitySource = new(DouglasMQInstrumentation.ActivitySourceName, Version);
 
+		public static readonly Meter Meter = new(DouglasMQInstrumentation.MeterName, Version);
+
+		// Bucket boundaries (seconds) recommended by the OpenTelemetry semantic conventions for durations.
+		private static readonly InstrumentAdvice<double> DurationAdvice = new()
+		{
+			HistogramBucketBoundaries = [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10],
+		};
+
+		public static readonly Counter<long> MessagesPublished = Meter.CreateCounter<long>(
+			"douglasmq.messages.published",
+			unit: "{message}",
+			description: "Number of messages published to the broker.");
+
+		public static readonly Histogram<double> PublishDuration = Meter.CreateHistogram<double>(
+			"douglasmq.publish.duration",
+			unit: "s",
+			description: "Time taken to publish a message, including the broker confirm when publisher confirms are enabled.",
+			tags: null,
+			advice: DurationAdvice);
+
+		public static readonly Counter<long> MessagesConsumed = Meter.CreateCounter<long>(
+			"douglasmq.messages.consumed",
+			unit: "{message}",
+			description: "Number of messages received and processed, tagged with the final outcome.");
+
+		public static readonly Histogram<double> ProcessDuration = Meter.CreateHistogram<double>(
+			"douglasmq.process.duration",
+			unit: "s",
+			description: "Time taken to process a received message, including all retry attempts.",
+			tags: null,
+			advice: DurationAdvice);
+
+		public static readonly Counter<long> HandlerRetries = Meter.CreateCounter<long>(
+			"douglasmq.handler.retries",
+			unit: "{retry}",
+			description: "Number of handler retry attempts.");
+
+		public static readonly Counter<long> MessagesDeadLettered = Meter.CreateCounter<long>(
+			"douglasmq.messages.dead_lettered",
+			unit: "{message}",
+			description: "Number of messages rejected to the dead-letter exchange.");
+
 		/// <summary>
-		/// Writes the trace context of <paramref name="activity"/> (<c>traceparent</c>, <c>tracestate</c>,
-		/// <c>baggage</c>) into AMQP headers.
+		/// Writes the trace context of <paramref name="activity"/> into AMQP headers.
 		/// </summary>
 		public static void InjectContext(Activity? activity, IDictionary<string, object?> headers)
 		{
@@ -49,30 +92,17 @@ namespace DouglasMQ.Diagnostics
 		}
 
 		/// <summary>
-		/// A remote context in the trace identified by a message's <c>TraceId</c>, for messages published
-		/// without a <c>traceparent</c> header. A <see cref="Guid"/> and a W3C trace id are both 16 bytes,
-		/// so the trace id is the <c>TraceId</c> itself. The parent span id is derived from the
-		/// <c>MessageId</c>, so every attempt at one message shares the same (synthetic) parent.
+		/// Reads W3C baggage from AMQP headers.
 		/// </summary>
-		public static ActivityContext FromMessageIds(Guid traceId, Guid messageId)
+		public static IEnumerable<KeyValuePair<string, string?>> ExtractBaggage(IDictionary<string, object?>? headers)
 		{
-			if (traceId == Guid.Empty)
+			if (headers is null || headers.Count == 0)
 			{
-				return default;
+				return Enumerable.Empty<KeyValuePair<string, string?>>();
 			}
 
-			Span<byte> messageBytes = stackalloc byte[16];
-			messageId.TryWriteBytes(messageBytes);
-			var spanBytes = messageBytes[..8];
-			var spanId = spanBytes.IndexOfAnyExcept((byte)0) < 0
-				? ActivitySpanId.CreateRandom()
-				: ActivitySpanId.CreateFromBytes(spanBytes);
-
-			return new ActivityContext(
-				ActivityTraceId.CreateFromString(traceId.ToString("N")),
-				spanId,
-				ActivityTraceFlags.Recorded,
-				isRemote: true);
+			return DistributedContextPropagator.Current.ExtractBaggage(headers, GetHeader)
+				?? Enumerable.Empty<KeyValuePair<string, string?>>();
 		}
 
 		private static void GetHeader(object? carrier, string name, out string? value, out IEnumerable<string>? values)

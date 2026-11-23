@@ -12,7 +12,9 @@ namespace DouglasMQ
 {
 	/// <summary>
 	/// Turns a message body into a <see cref="DeliveryOutcome"/>: deserializes it, runs the handler, and
-	/// retries with backoff on failure. Each attempt runs inside its own trace span and logger scope.
+	/// retries with backoff on failure. Each attempt runs inside its own <c>{queue} process</c> span (a child of
+	/// the delivery's <c>process {queue}</c> span) and logger scope; retries, failures and the error type are
+	/// recorded on the delivery's <see cref="DeliveryTelemetry"/>.
 	/// Knows nothing about channels or acknowledgements, so the processing rules can be tested without RabbitMQ.
 	/// </summary>
 	internal sealed class DeliveryProcessor
@@ -53,6 +55,7 @@ namespace DouglasMQ
 		/// </param>
 		public async Task<DeliveryOutcome> ProcessAsync(ReadOnlyMemory<byte> body, DeliveryInfo delivery, CancellationToken stoppingToken)
 		{
+			var telemetry = delivery.Telemetry;
 			object? message;
 			try
 			{
@@ -63,6 +66,8 @@ namespace DouglasMQ
 				// Poison message: retrying cannot help, so dead-letter immediately.
 				_logger.LogError(ex, "Failed to deserialize message for {MessageType} on {ConsumerTag}. Dead-lettering.",
 					_invoker.MessageType.Name, ConsumerTag);
+				telemetry.ErrorType = ex.GetType().FullName;
+				telemetry.Activity?.AddException(ex);
 				return DeliveryOutcome.DeadLetter;
 			}
 
@@ -70,12 +75,21 @@ namespace DouglasMQ
 			{
 				_logger.LogWarning("Received null message for {MessageType} on {ConsumerTag}. Dead-lettering.",
 					_invoker.MessageType.Name, ConsumerTag);
+				telemetry.ErrorType = "deserialization_failed";
 				return DeliveryOutcome.DeadLetter;
 			}
 
 			// IHandler<T> constrains T to IMessage, so this always succeeds for real handlers.
 			var identity = message as IMessage;
-			var parent = ResolveParentContext(delivery, identity);
+			if (identity is not null && telemetry.Activity is { IsAllDataRequested: true } deliveryActivity)
+			{
+				deliveryActivity.SetTag(MessagingTags.MessageId, identity.MessageId.ToString());
+				deliveryActivity.SetTag(MessagingTags.ConversationId, identity.TraceId.ToString());
+			}
+
+			// Attempts nest under the delivery span when there is one; otherwise (e.g. no delivery span
+			// because the processor is used on its own) they continue the publisher's trace directly.
+			var parent = Activity.Current?.Context ?? DouglasMQTelemetry.ExtractContext(delivery.Headers);
 
 			var lastException = default(Exception);
 			for (var attempt = 0; attempt < _retryPolicy.MaxAttempts; attempt++)
@@ -85,6 +99,7 @@ namespace DouglasMQ
 					var delay = _retryPolicy.GetDelay(attempt);
 					_logger.LogWarning("Retrying handler {Handler} for message {MessageType}, attempt {Attempt}/{RetryCount} after {DelayMs}ms.",
 						_invoker.HandlerName, _invoker.MessageType.Name, attempt, _retryPolicy.RetryCount, delay.TotalMilliseconds);
+					RecordRetry(telemetry, attempt, delay);
 
 					try
 					{
@@ -111,11 +126,15 @@ namespace DouglasMQ
 				{
 					RecordFailure(activity, ex);
 
+					// Every failed attempt is also recorded on the delivery span, so it shows the full history.
+					telemetry.Activity?.AddException(ex, new TagList { { MessagingTags.Attempt, attempt } });
+
 					if (NonRetryableException.Find(ex) is { } nonRetryable)
 					{
 						_logger.LogWarning(ex,
 							"Handler {Handler} rejected message {MessageType} as non-retryable: {Reason} Dead-lettering without retrying.",
 							_invoker.HandlerName, _invoker.MessageType.Name, nonRetryable.Message);
+						telemetry.ErrorType = ex.GetType().FullName;
 						return DeliveryOutcome.DeadLetter;
 					}
 
@@ -128,7 +147,26 @@ namespace DouglasMQ
 			_logger.LogError(lastException,
 				"Handler {Handler} failed for message {MessageType} after {Attempts} attempt(s). Dead-lettering.",
 				_invoker.HandlerName, _invoker.MessageType.Name, _retryPolicy.MaxAttempts);
+			telemetry.ErrorType = lastException?.GetType().FullName;
 			return DeliveryOutcome.DeadLetter;
+		}
+
+		private void RecordRetry(DeliveryTelemetry telemetry, int attempt, TimeSpan delay)
+		{
+			telemetry.Retries = attempt;
+			DouglasMQTelemetry.HandlerRetries.Add(1, new TagList
+			{
+				{ MessagingTags.System, MessagingTags.SystemValue },
+				{ MessagingTags.DestinationName, _binding.ExchangeName },
+				{ MessagingTags.SubscriptionName, _binding.QueueName },
+				{ MessagingTags.Handler, _invoker.HandlerName },
+				{ MessagingTags.MessageType, _invoker.MessageType.Name },
+			});
+			telemetry.Activity?.AddEvent(new ActivityEvent("douglasmq.retry", tags: new ActivityTagsCollection
+			{
+				{ MessagingTags.Attempt, attempt },
+				{ "douglasmq.retry.delay_ms", delay.TotalMilliseconds },
+			}));
 		}
 
 		private DeliveryOutcome Abandon()
@@ -137,38 +175,18 @@ namespace DouglasMQ
 			return DeliveryOutcome.Abandon;
 		}
 
-		/// <summary>
-		/// The sender's trace context: the <c>traceparent</c> header when the publisher set one, otherwise
-		/// the trace named by the message's <c>TraceId</c>. An already-current activity in the same trace
-		/// (such as RabbitMQ.Client's own receive span) is preferred, so DouglasMQ's span nests under it.
-		/// </summary>
-		private static ActivityContext ResolveParentContext(DeliveryInfo delivery, IMessage? identity)
-		{
-			var remote = DouglasMQTelemetry.ExtractContext(delivery.Headers);
-			if (remote == default && identity is not null)
-			{
-				remote = DouglasMQTelemetry.FromMessageIds(identity.TraceId, identity.MessageId);
-			}
-
-			var current = Activity.Current;
-			if (current is not null && (remote == default || current.TraceId == remote.TraceId))
-			{
-				return current.Context;
-			}
-
-			return remote;
-		}
-
 		private Activity? StartAttemptActivity(ActivityContext parent, DeliveryInfo delivery, IMessage? identity, int attempt)
 		{
 			var activity = DouglasMQTelemetry.ActivitySource.StartActivity(_activityName, ActivityKind.Consumer, parent);
 			if (activity is { IsAllDataRequested: true })
 			{
 				activity.SetTag(MessagingTags.System, MessagingTags.SystemValue);
+				activity.SetTag(MessagingTags.OperationName, "process");
 				activity.SetTag(MessagingTags.OperationType, "process");
 				activity.SetTag(MessagingTags.DestinationName, string.IsNullOrEmpty(delivery.Exchange) ? _binding.ExchangeName : delivery.Exchange);
 				activity.SetTag(MessagingTags.RoutingKey, string.IsNullOrEmpty(delivery.RoutingKey) ? _binding.RoutingKey : delivery.RoutingKey);
 				activity.SetTag(MessagingTags.ConsumerGroup, _binding.QueueName);
+				activity.SetTag(MessagingTags.SubscriptionName, _binding.QueueName);
 				activity.SetTag(MessagingTags.Handler, _invoker.HandlerName);
 				activity.SetTag(MessagingTags.MessageType, _invoker.MessageType.Name);
 				activity.SetTag(MessagingTags.Attempt, attempt);

@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using DouglasMQ.Diagnostics;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
@@ -135,17 +137,27 @@ namespace DouglasMQ
 				_inFlight++;
 			}
 
+			using var activity = StartDeliveryActivity(eventArgs);
+			var telemetry = new DeliveryTelemetry(activity);
+			var startTimestamp = Stopwatch.GetTimestamp();
 			try
 			{
-				var delivery = new DeliveryInfo(eventArgs.Exchange, eventArgs.RoutingKey, eventArgs.BasicProperties?.Headers);
+				var delivery = new DeliveryInfo(eventArgs.Exchange, eventArgs.RoutingKey, eventArgs.BasicProperties?.Headers, telemetry);
 				var outcome = await _processor.ProcessAsync(eventArgs.Body, delivery, _stopping.Token);
-				if (outcome != DeliveryOutcome.Abandon)
+				if (outcome == DeliveryOutcome.Abandon)
 				{
-					await SettleAsync(channel, eventArgs.DeliveryTag, outcome);
+					telemetry.Outcome = MessagingTags.OutcomeRequeued;
+				}
+				else
+				{
+					telemetry.Outcome = outcome == DeliveryOutcome.Ack ? MessagingTags.OutcomeAck : MessagingTags.OutcomeDeadLettered;
+					await SettleAsync(channel, eventArgs.DeliveryTag, outcome, telemetry);
 				}
 			}
 			finally
 			{
+				RecordDelivery(telemetry, Stopwatch.GetElapsedTime(startTimestamp));
+
 				lock (_gate)
 				{
 					_inFlight--;
@@ -157,7 +169,110 @@ namespace DouglasMQ
 			}
 		}
 
-		private async Task SettleAsync(IChannel channel, ulong deliveryTag, DeliveryOutcome outcome)
+		/// <summary>
+		/// Starts the delivery's <c>process {queue}</c> span, parented on the publisher's trace context from
+		/// the message headers. Per-attempt spans are created as its children by the <see cref="DeliveryProcessor"/>.
+		/// </summary>
+		private Activity? StartDeliveryActivity(BasicDeliverEventArgs eventArgs)
+		{
+			if (!DouglasMQTelemetry.ActivitySource.HasListeners())
+			{
+				return null;
+			}
+
+			var headers = eventArgs.BasicProperties?.Headers;
+			var remoteContext = DouglasMQTelemetry.ExtractContext(headers);
+
+			// RabbitMQ.Client's own "deliver" activity may already be current and parented on the
+			// same remote context. Nest under it in that case; otherwise parent on the publisher's context.
+			var current = Activity.Current;
+			var parent = current is not null && (remoteContext == default || current.TraceId == remoteContext.TraceId)
+				? current.Context
+				: remoteContext;
+
+			var activity = DouglasMQTelemetry.ActivitySource.StartActivity(
+				$"process {QueueName}",
+				ActivityKind.Consumer,
+				parent);
+
+			if (activity is null)
+			{
+				return null;
+			}
+
+			foreach (var baggage in DouglasMQTelemetry.ExtractBaggage(headers))
+			{
+				if (activity.GetBaggageItem(baggage.Key) is null)
+				{
+					activity.SetBaggage(baggage.Key, baggage.Value);
+				}
+			}
+
+			if (activity.IsAllDataRequested)
+			{
+				activity.SetTag(MessagingTags.System, MessagingTags.SystemValue);
+				activity.SetTag(MessagingTags.OperationName, "process");
+				activity.SetTag(MessagingTags.OperationType, "process");
+				activity.SetTag(MessagingTags.DestinationName, _registration.Binding.ExchangeName);
+				activity.SetTag(MessagingTags.SubscriptionName, QueueName);
+				activity.SetTag(MessagingTags.RoutingKey, eventArgs.RoutingKey);
+				activity.SetTag(MessagingTags.DeliveryTag, (long)eventArgs.DeliveryTag);
+				activity.SetTag(MessagingTags.Redelivered, eventArgs.Redelivered);
+				activity.SetTag(MessagingTags.BodySize, eventArgs.Body.Length);
+				activity.SetTag(MessagingTags.Handler, HandlerName);
+				activity.SetTag(MessagingTags.MessageType, _registration.Invoker.MessageType.Name);
+			}
+
+			return activity;
+		}
+
+		private void RecordDelivery(DeliveryTelemetry telemetry, TimeSpan elapsed)
+		{
+			var activity = telemetry.Activity;
+			if (activity is not null)
+			{
+				activity.SetTag(MessagingTags.RetryCount, telemetry.Retries);
+				activity.SetTag(MessagingTags.Outcome, telemetry.Outcome);
+				if (telemetry.ErrorType is not null)
+				{
+					activity.SetTag(MessagingTags.ErrorType, telemetry.ErrorType);
+				}
+
+				if (telemetry.Outcome == MessagingTags.OutcomeDeadLettered)
+				{
+					activity.SetStatus(ActivityStatusCode.Error, $"Message dead-lettered ({telemetry.ErrorType}).");
+				}
+			}
+
+			var tags = new TagList
+			{
+				{ MessagingTags.System, MessagingTags.SystemValue },
+				{ MessagingTags.DestinationName, _registration.Binding.ExchangeName },
+				{ MessagingTags.SubscriptionName, QueueName },
+				{ MessagingTags.Handler, HandlerName },
+				{ MessagingTags.MessageType, _registration.Invoker.MessageType.Name },
+			};
+
+			if (telemetry.Outcome is not null)
+			{
+				tags.Add(MessagingTags.Outcome, telemetry.Outcome);
+			}
+
+			if (telemetry.ErrorType is not null)
+			{
+				tags.Add(MessagingTags.ErrorType, telemetry.ErrorType);
+			}
+
+			DouglasMQTelemetry.MessagesConsumed.Add(1, tags);
+			if (telemetry.Outcome == MessagingTags.OutcomeDeadLettered)
+			{
+				DouglasMQTelemetry.MessagesDeadLettered.Add(1, tags);
+			}
+
+			DouglasMQTelemetry.ProcessDuration.Record(elapsed.TotalSeconds, tags);
+		}
+
+		private async Task SettleAsync(IChannel channel, ulong deliveryTag, DeliveryOutcome outcome, DeliveryTelemetry telemetry)
 		{
 			try
 			{
@@ -178,6 +293,8 @@ namespace DouglasMQ
 				// the broker will redeliver the message.
 				_logger.LogWarning(ex, "Could not settle delivery {DeliveryTag} on {ConsumerTag}: channel is closed. It will be redelivered.",
 					deliveryTag, ConsumerTag);
+				telemetry.Outcome = MessagingTags.OutcomeRequeued;
+				telemetry.Activity?.AddException(ex);
 			}
 		}
 

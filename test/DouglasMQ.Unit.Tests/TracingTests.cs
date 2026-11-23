@@ -15,7 +15,8 @@ using Xunit;
 namespace DouglasMQ.Unit.Tests
 {
 	/// <summary>
-	/// One span and one log scope per handling attempt, joined to the sender's trace.
+	/// One span and one log scope per handling attempt, joined to the sender's trace. How attempt spans nest
+	/// under the per-delivery span is covered by <see cref="TelemetryTests"/>.
 	/// </summary>
 	public sealed class TracingTests : IDisposable
 	{
@@ -52,7 +53,7 @@ namespace DouglasMQ.Unit.Tests
 
 		private static ReadOnlyMemory<byte> Body(Message message) => Encoding.UTF8.GetBytes(new SystemTextJsonSerializer().Serialize(message));
 
-		private static DeliveryInfo Delivery(IDictionary<string, object?>? headers = null) => new("tracing.exchange", "tracing.created", headers);
+		private static DeliveryInfo Delivery(IDictionary<string, object?>? headers = null) => new("tracing.exchange", "tracing.created", headers, DeliveryTelemetry.None);
 
 		[Fact]
 		public async Task EachAttempt_GetsAConsumerSpanWithMessagingTags()
@@ -98,17 +99,6 @@ namespace DouglasMQ.Unit.Tests
 			var span = Assert.Single(_stopped);
 			Assert.Equal(traceId, span.TraceId);
 			Assert.Equal(parentSpanId, span.ParentSpanId);
-		}
-
-		[Fact]
-		public async Task WithoutTraceparent_TheMessageTraceIdIsTheTrace()
-		{
-			var message = new Message();
-
-			await CreateProcessor(new Handler()).ProcessAsync(Body(message), Delivery(), CancellationToken.None);
-
-			var span = Assert.Single(_stopped);
-			Assert.Equal(message.TraceId.ToString("N"), span.TraceId.ToHexString());
 		}
 
 		[Fact]
