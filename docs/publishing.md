@@ -76,7 +76,31 @@ Publisher confirms cause `PublishAsync`/`SendAsync` to wait until the broker has
 
 Under the hood, the channel is created with `CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true)` using the RabbitMQ.Client 7.x API.
 
-**Trade-offs:** Publisher confirms have a latency cost because each `PublishAsync` call blocks until the broker responds. For high-throughput scenarios without strict durability requirements, leave this `false` (the default).
+Confirms are **on by default**. To turn them off:
+
+```csharp
+.Configure(c => c.PublisherConfirms = false)
+```
+
+**Trade-offs:** Publisher confirms have a latency cost because each `PublishAsync` call waits until the broker responds. For high-throughput scenarios without strict durability requirements you can turn them off, at the cost of unroutable messages being logged rather than thrown (see below).
+
+## Unroutable messages
+
+A message the broker cannot route is never dropped silently. `PublishAsync` and `SendAsync` throw `UnroutableMessageException` (with `Exchange`, `RoutingKey`, `ReplyCode` and `ReplyText`) when:
+
+| Case | `ReplyCode` | Confirms on | Confirms off |
+|------|-------------|-------------|--------------|
+| The exchange does not exist (no consumer has ever started) | `404` (`UnroutableMessageException.NotFound`) | Throws | Throws |
+| The exchange exists but no queue is bound for the routing key | `312` (`UnroutableMessageException.NoRoute`) | Throws | Logged at Error; the call returns normally |
+
+How it works:
+
+- **Missing exchange.** Before the first publish to an exchange, the publisher checks once that it exists (a passive declare, on a short-lived channel of its own so the shared publish channel is not closed). The result is cached for the publisher's lifetime; a failed check is not cached, so the send succeeds once a consumer has declared the exchange.
+- **No queue bound.** Every message is published with `mandatory: true`, so the broker sends it back (`basic.return`) instead of dropping it. With confirms on, the publish call throws. With confirms off the call has already returned by the time the broker answers, so the return is logged at Error with the message id, exchange and routing key.
+
+This applies to events as well as commands: publishing an event that no queue subscribes to throws (with confirms on). Bind at least one queue, for example by starting its consumer, before publishing.
+
+**The publisher does not declare exchanges.** The consumer side owns the topology (`Handler` attributes declare the exchange, queue and binding). Declaring the exchange from the publisher as well could disagree with the consumer's exchange type (the broker then fails one side with `PRECONDITION_FAILED`), and it would only turn a missing exchange into an unroutable message, which without confirms cannot be reported to the caller.
 
 ## MessageId and TraceId
 

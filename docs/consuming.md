@@ -27,6 +27,21 @@ public class OrderPlacedHandler : IHandler<OrderPlaced>
 
 The consumer tag (shown in the RabbitMQ management UI) is automatically generated as `{exchangeName}.{queueName}.{routingKey}`.
 
+### Cancellation on shutdown
+
+Implement the overload that takes a `CancellationToken` to be told when the host stops while your handler is still running:
+
+```csharp
+public async Task HandleAsync(OrderPlaced message, CancellationToken cancellationToken)
+{
+    await _orders.SaveAsync(message.OrderId, cancellationToken);
+}
+```
+
+Implement exactly one of the two overloads. Each one's default implementation calls the other, so handlers written against `HandleAsync(message)` compile and run unchanged (they are never cancelled). A handler that implements neither is rejected at start-up.
+
+When the host stops, each consumer stops taking new deliveries, then **waits for running handlers to finish** and acknowledge. The token is cancelled only if a handler is still running when the stop's time runs out (the host's `ShutdownTimeout`, 30 s by default with DI). If the handler then throws `OperationCanceledException`, the delivery is neither acknowledged nor dead-lettered, and the broker redelivers it to another consumer. Make such handlers idempotent, or do work that is safe to repeat.
+
 ## Injecting services into handlers
 
 Handlers are plain classes — any dependencies they need must be passed via constructor injection.

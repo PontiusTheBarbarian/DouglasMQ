@@ -80,14 +80,16 @@ A value between 5 and 50 is typical for most workloads. Tune based on your messa
 Publisher confirms cause each publish to block until the broker acknowledges the message has been written to disk:
 
 ```csharp
-c.PublisherConfirms = true;  // default: false
+c.PublisherConfirms = true;  // default: true
 ```
 
-Use this when:
+Confirms are on by default. With them on, a message no queue is bound for makes the publish throw `UnroutableMessageException` (see [Publishing](publishing.md#unroutable-messages)); with them off it is only logged.
+
+Keep them on when:
 - Message loss is unacceptable (e.g. payment events, audit logs)
 - You are publishing to a durable queue that must survive a broker restart
 
-Do not use this when:
+Consider turning them off when:
 - Latency matters more than durability (e.g. real-time metrics, telemetry)
 - You have application-level retry that handles message loss
 

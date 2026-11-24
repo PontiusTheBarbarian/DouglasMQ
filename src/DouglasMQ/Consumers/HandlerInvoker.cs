@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using DouglasMQ.Messages;
 using Microsoft.Extensions.DependencyInjection;
@@ -8,7 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace DouglasMQ
 {
 	/// <summary>
-	/// A strongly-typed call to <see cref="IHandler{TMessage}.HandleAsync"/>, built once per handler
+	/// A strongly-typed call to <see cref="IHandler{TMessage}.HandleAsync(TMessage, CancellationToken)"/>, built once per handler
 	/// at startup so no reflection happens per message.
 	/// </summary>
 	/// <remarks>
@@ -19,9 +20,9 @@ namespace DouglasMQ
 	/// </remarks>
 	internal sealed class HandlerInvoker
 	{
-		private readonly Func<object, Task> _invoke;
+		private readonly Func<object, CancellationToken, Task> _invoke;
 
-		private HandlerInvoker(Type messageType, Type handlerType, Func<object, Task> invoke)
+		private HandlerInvoker(Type messageType, Type handlerType, Func<object, CancellationToken, Task> invoke)
 		{
 			MessageType = messageType;
 			HandlerType = handlerType;
@@ -35,7 +36,10 @@ namespace DouglasMQ
 
 		public string HandlerName => HandlerType.Name;
 
-		public Task InvokeAsync(object message) => _invoke(message);
+		/// <summary>Calls the handler.</summary>
+		/// <param name="message">The deserialized message.</param>
+		/// <param name="cancellationToken">Passed to <see cref="IHandler{TMessage}.HandleAsync(TMessage, CancellationToken)"/>.</param>
+		public Task InvokeAsync(object message, CancellationToken cancellationToken = default) => _invoke(message, cancellationToken);
 
 		/// <summary>
 		/// Builds an invoker that sends every message to the same <paramref name="handler"/> instance.
@@ -54,7 +58,7 @@ namespace DouglasMQ
 			messageType = ResolveMessageType(handlerType, messageType);
 			var dispatch = CreateDispatch(messageType);
 
-			return new HandlerInvoker(messageType, handlerType, message => dispatch(handler, message));
+			return new HandlerInvoker(messageType, handlerType, (message, cancellationToken) => dispatch(handler, message, cancellationToken));
 		}
 
 		/// <summary>
@@ -82,13 +86,13 @@ namespace DouglasMQ
 			messageType = ResolveMessageType(handlerType, messageType);
 			var dispatch = CreateDispatch(messageType);
 
-			return new HandlerInvoker(messageType, handlerType, async message =>
+			return new HandlerInvoker(messageType, handlerType, async (message, cancellationToken) =>
 			{
 				await using var scope = scopeFactory.CreateAsyncScope();
 				var handler = activate(scope.ServiceProvider);
 				try
 				{
-					await dispatch(handler, message);
+					await dispatch(handler, message, cancellationToken);
 				}
 				finally
 				{
@@ -110,13 +114,36 @@ namespace DouglasMQ
 						$"(found {handledTypes.Count}). Register it once per message type instead.");
 				}
 
-				return handledTypes[0];
+				return EnsureImplementsHandleAsync(handlerType, handledTypes[0]);
 			}
 
 			if (!handledTypes.Contains(messageType))
 			{
 				throw new InvalidOperationException(
 					$"Handler '{handlerType.Name}' does not implement {nameof(IHandler<IMessage>)}<{messageType.Name}>.");
+			}
+
+			return EnsureImplementsHandleAsync(handlerType, messageType);
+		}
+
+		/// <summary>
+		/// Both <c>HandleAsync</c> overloads have default implementations that call each other, so a
+		/// handler that implements neither would recurse until the stack overflows on its first message.
+		/// </summary>
+		private static Type EnsureImplementsHandleAsync(Type handlerType, Type messageType)
+		{
+			if (handlerType.IsInterface)
+			{
+				return messageType;
+			}
+
+			var interfaceType = typeof(IHandler<>).MakeGenericType(messageType);
+			var map = handlerType.GetInterfaceMap(interfaceType);
+			if (map.TargetMethods.All(m => m.DeclaringType == interfaceType))
+			{
+				throw new InvalidOperationException(
+					$"Handler '{handlerType.Name}' implements {nameof(IHandler<IMessage>)}<{messageType.Name}> but neither HandleAsync overload. " +
+					"Implement HandleAsync(message, cancellationToken) (or HandleAsync(message)).");
 			}
 
 			return messageType;
@@ -138,17 +165,17 @@ namespace DouglasMQ
 			}
 		}
 
-		private static Func<object, object, Task> CreateDispatch(Type messageType)
+		private static Func<object, object, CancellationToken, Task> CreateDispatch(Type messageType)
 		{
 			var factory = typeof(HandlerInvoker)
 				.GetMethod(nameof(CreateTypedDispatch), BindingFlags.NonPublic | BindingFlags.Static)!
 				.MakeGenericMethod(messageType);
 
-			return (Func<object, object, Task>)factory.Invoke(null, null)!;
+			return (Func<object, object, CancellationToken, Task>)factory.Invoke(null, null)!;
 		}
 
-		private static Func<object, object, Task> CreateTypedDispatch<TMessage>()
+		private static Func<object, object, CancellationToken, Task> CreateTypedDispatch<TMessage>()
 			where TMessage : class, IMessage
-			=> (handler, message) => ((IHandler<TMessage>)handler).HandleAsync((TMessage)message);
+			=> (handler, message, cancellationToken) => ((IHandler<TMessage>)handler).HandleAsync((TMessage)message, cancellationToken);
 	}
 }

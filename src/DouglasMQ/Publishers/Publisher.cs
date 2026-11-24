@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
@@ -8,6 +9,8 @@ using DouglasMQ.Messages;
 using DouglasMQ.Serialization;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 
 namespace DouglasMQ
 {
@@ -15,6 +18,17 @@ namespace DouglasMQ
 	/// Provides functionality to publish events and send commands to a message broker.
 	/// Reuses a single long-lived channel and optionally enables broker publisher confirms.
 	/// </summary>
+	/// <remarks>
+	/// A message the broker cannot route is never dropped silently. Before the first publish to an
+	/// exchange the publisher checks, once, that the exchange exists (a passive declare on a short-lived
+	/// channel) and throws <see cref="UnroutableMessageException"/> if it does not. Every message is
+	/// published <c>mandatory</c>, so a message no queue is bound for comes back as <c>basic.return</c>:
+	/// with <see cref="Configuration.PublisherConfirms"/> on that is thrown as
+	/// <see cref="UnroutableMessageException"/>; with confirms off it is logged at Error.
+	/// The publisher does not declare exchanges itself: the consumer side (<c>Topology</c>) owns them,
+	/// and declaring them here could disagree with the consumer's exchange type and would turn a
+	/// missing exchange into an unroutable message that, without confirms, cannot be reported.
+	/// </remarks>
 	public sealed class Publisher : IPublisher, IAsyncDisposable
 	{
 		private readonly Func<CancellationToken, Task<IConnection>> _connectionFactory;
@@ -24,6 +38,7 @@ namespace DouglasMQ
 		private readonly bool _publisherConfirms;
 		private readonly SemaphoreSlim _channelLock = new SemaphoreSlim(1, 1);
 		private IConnection? _connection;
+		private readonly ConcurrentDictionary<string, bool> _verifiedExchanges = new(StringComparer.Ordinal);
 		private volatile IChannel? _channel;
 		private bool _disposed;
 
@@ -51,7 +66,7 @@ namespace DouglasMQ
 			_ownsConnection = ownsConnection;
 			_serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
 			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
-			_publisherConfirms = configuration?.PublisherConfirms ?? false;
+			_publisherConfirms = configuration?.PublisherConfirms ?? true;
 		}
 
 		/// <summary>
@@ -138,6 +153,7 @@ namespace DouglasMQ
 			try
 			{
 				var channel = await GetOrCreateChannelAsync(cancellationToken);
+				await EnsureExchangeExistsAsync(route.ExchangeName, route.RoutingKey, cancellationToken);
 				var body = _serializer.SerializeToBytes(message);
 				activity?.SetTag(MessagingTags.BodySize, body.Length);
 
@@ -162,13 +178,27 @@ namespace DouglasMQ
 				_logger.LogDebug("Publishing {MessageType} {MessageId} to exchange '{Exchange}' with routing key '{RoutingKey}'.",
 					messageType, message.MessageId, route.ExchangeName, route.RoutingKey);
 
-				await channel.BasicPublishAsync(
-					exchange: route.ExchangeName,
-					routingKey: route.RoutingKey,
-					mandatory: false,
-					basicProperties: properties,
-					body: body,
-					cancellationToken: cancellationToken);
+				try
+				{
+					// Mandatory, so the broker returns a message no queue is bound for instead of dropping it.
+					await channel.BasicPublishAsync(
+						exchange: route.ExchangeName,
+						routingKey: route.RoutingKey,
+						mandatory: true,
+						basicProperties: properties,
+						body: body,
+						cancellationToken: cancellationToken);
+				}
+				catch (PublishReturnException ex)
+				{
+					throw new UnroutableMessageException(route.ExchangeName, route.RoutingKey, ex.ReplyCode, ex.ReplyText ?? "NO_ROUTE", ex);
+				}
+				catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == UnroutableMessageException.NotFound)
+				{
+					// The exchange was deleted after it was checked. Check it again next time.
+					_verifiedExchanges.TryRemove(route.ExchangeName, out _);
+					throw new UnroutableMessageException(route.ExchangeName, route.RoutingKey, UnroutableMessageException.NotFound, ex.ShutdownReason.ReplyText, ex);
+				}
 
 				DouglasMQTelemetry.MessagesPublished.Add(1, metricTags);
 			}
@@ -185,6 +215,55 @@ namespace DouglasMQ
 			{
 				DouglasMQTelemetry.PublishDuration.Record(Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, metricTags);
 			}
+		}
+
+		/// <summary>
+		/// Throws <see cref="UnroutableMessageException"/> if <paramref name="exchange"/> does not exist.
+		/// Checked once per exchange; the check uses its own channel because a failed passive declare
+		/// closes the channel it ran on, and the publish channel is shared.
+		/// </summary>
+		private async ValueTask EnsureExchangeExistsAsync(string exchange, string routingKey, CancellationToken cancellationToken)
+		{
+			// The default exchange ("") always exists and cannot be declared.
+			if (exchange.Length == 0 || _verifiedExchanges.ContainsKey(exchange))
+			{
+				return;
+			}
+
+			var connection = _connection ?? throw new InvalidOperationException("The publisher has no connection.");
+			var probe = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+			try
+			{
+				await probe.ExchangeDeclarePassiveAsync(exchange, cancellationToken);
+			}
+			catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == UnroutableMessageException.NotFound)
+			{
+				throw new UnroutableMessageException(exchange, routingKey, UnroutableMessageException.NotFound, ex.ShutdownReason.ReplyText, ex);
+			}
+			finally
+			{
+				await AmqpResources.CloseAndDisposeAsync(probe);
+			}
+
+			_verifiedExchanges.TryAdd(exchange, true);
+		}
+
+		private Task OnBasicReturnAsync(object sender, BasicReturnEventArgs args)
+		{
+			// With confirms on, the same return surfaces as UnroutableMessageException from the publish call.
+			if (!_publisherConfirms)
+			{
+				_logger.LogError(
+					"Message {MessageId} of type {MessageType} was returned by the broker as unroutable and has been lost: no queue is bound to exchange '{Exchange}' for routing key '{RoutingKey}' ({ReplyCode} {ReplyText}). Enable PublisherConfirms to have the publish throw instead.",
+					args.BasicProperties.MessageId,
+					args.BasicProperties.Type,
+					args.Exchange,
+					args.RoutingKey,
+					args.ReplyCode,
+					args.ReplyText);
+			}
+
+			return Task.CompletedTask;
 		}
 
 		private async ValueTask<IChannel> GetOrCreateChannelAsync(CancellationToken cancellationToken)
@@ -211,6 +290,7 @@ namespace DouglasMQ
 					_logger.LogWarning("Publisher channel was closed ({CloseReason}). Creating a new channel.", _channel.CloseReason);
 					var stale = _channel;
 					_channel = null;
+					stale.BasicReturnAsync -= OnBasicReturnAsync;
 					await stale.DisposeAsync();
 				}
 
@@ -223,8 +303,10 @@ namespace DouglasMQ
 					publisherConfirmationTrackingEnabled: _publisherConfirms);
 
 				_connection ??= await _connectionFactory(cancellationToken);
-				_channel = await _connection.CreateChannelAsync(options, cancellationToken);
-				return _channel;
+				var created = await _connection.CreateChannelAsync(options, cancellationToken);
+				created.BasicReturnAsync += OnBasicReturnAsync;
+				_channel = created;
+				return created;
 			}
 			finally
 			{

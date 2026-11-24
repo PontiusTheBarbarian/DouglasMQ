@@ -45,6 +45,10 @@ namespace DouglasMQ
 		// disposed: a late delivery may still read its token, and it holds no timer.
 		private readonly CancellationTokenSource _stopping = new();
 
+		// Passed to handlers. Cancelled only when stopping gives up waiting for them (the stop call's
+		// token, i.e. the host's shutdown timeout), so a stop lets running handlers finish first.
+		private readonly CancellationTokenSource _handlersCancelled = new();
+
 		// Guards _inFlight, _stopRequested and _stopTask.
 		private readonly object _gate = new();
 		private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -143,7 +147,7 @@ namespace DouglasMQ
 			try
 			{
 				var delivery = new DeliveryInfo(eventArgs.Exchange, eventArgs.RoutingKey, eventArgs.BasicProperties?.Headers, telemetry);
-				var outcome = await _processor.ProcessAsync(eventArgs.Body, delivery, _stopping.Token);
+				var outcome = await _processor.ProcessAsync(eventArgs.Body, delivery, _stopping.Token, _handlersCancelled.Token);
 				if (outcome == DeliveryOutcome.Abandon)
 				{
 					telemetry.Outcome = MessagingTags.OutcomeRequeued;
@@ -360,6 +364,10 @@ namespace DouglasMQ
 			}
 			catch (OperationCanceledException)
 			{
+				// Out of time: tell the handlers still running. Their deliveries are not settled, so
+				// the broker redelivers them once the channel closes.
+				await _handlersCancelled.CancelAsync();
+
 				int inFlight;
 				lock (_gate)
 				{

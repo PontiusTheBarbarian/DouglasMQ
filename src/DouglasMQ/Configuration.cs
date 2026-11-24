@@ -104,9 +104,11 @@ namespace DouglasMQ
 		public int RetryDelayMs { get; set; } = 1000;
 
 		/// <summary>
-		/// When true the publisher will wait for broker confirmation that each message has been
-		/// persisted before returning. Has a performance cost. Defaults to false.
+		/// When true the publisher waits for the broker to confirm each message before returning, and a
+		/// message no queue is bound for throws <see cref="UnroutableMessageException"/>. When false,
+		/// publishing is faster but an unroutable message is only logged at Error. A publish to an
+		/// exchange that does not exist throws either way. Defaults to true.
 		/// </summary>
-		public bool PublisherConfirms { get; set; } = false;
+		public bool PublisherConfirms { get; set; } = true;
 	}
 }

@@ -66,12 +66,39 @@ host.Run();
 }
 ```
 
+## Publisher only
+
+An app that only sends (for example an API that sends commands to a separate worker) can register the publisher without starting any consumers or declaring anything:
+
+```csharp
+builder.Services.AddDouglasMQPublisher(builder.Configuration);                      // DouglasMQ section, SystemTextJsonSerializer
+builder.Services.AddDouglasMQPublisher(builder.Configuration, typeof(MySerializer)); // with a serializer
+builder.Services.AddDouglasMQPublisher(c => c.HostName = "rabbitmq");              // configured in code
+```
+
+The publisher connects on the first publish, so an unreachable broker does not stop the app from starting; that publish throws, and the next one tries again. Calling `AddDouglasMQPublisher` as well as `AddDouglasMQ` is harmless: both register the same single publisher, configured by whichever call comes first.
+
+## Health checks
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddDouglasMQPublisherCheck(tags: ["ready"])   // the publisher can reach the broker
+    .AddDouglasMQConsumersCheck(tags: ["ready"]);  // the consumers started by AddDouglasMQ are running
+```
+
+| Check | Default name | Reports |
+|-------|--------------|---------|
+| `AddDouglasMQPublisherCheck` | `douglasmq-publisher` | Opens the publisher's connection and channel if they are not open (so a probe also reconnects it after an outage), with a 5 s timeout. Unhealthy if that fails |
+| `AddDouglasMQConsumersCheck` | `douglasmq-consumers` | Unhealthy until `IDouglasMQStatus.ConsumersRunning` is true. Opens no connection. Needs `AddDouglasMQ` |
+
+Both take `name`, `failureStatus` and `tags`.
+
 ## What gets registered
 
 | Service | Lifetime | Description |
 |---------|----------|-------------|
 | `Configuration` | Singleton | Resolved configuration values |
-| `IPublisher` | Singleton | `Publisher` with its **own** connection, opened on first publish. It keeps working while the host stops, and the container closes it on disposal |
+| `IPublisher` (and `Publisher`) | Singleton | `Publisher` with its **own** connection, opened on first publish. It keeps working while the host stops, and the container closes it on disposal |
 | `Dispatcher` | `IHostedService` | Opens its own consumer connection and starts one consumer per registered handler in the background once the host starts, retrying while the broker is unreachable (see [Resilience](resilience.md#starting-while-the-broker-is-unreachable)); stops them gracefully and closes the connection when it stops. Neither building the container nor starting the host touches the network |
 | `IDouglasMQStatus` | Singleton | `ConsumersRunning` tells you whether the consumers are up, e.g. for a readiness check |
 
