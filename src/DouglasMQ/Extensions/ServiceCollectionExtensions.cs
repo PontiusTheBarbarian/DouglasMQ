@@ -127,6 +127,78 @@ namespace DouglasMQ
 		}
 
 		/// <summary>
+		/// Registers only the publisher: an <see cref="IPublisher"/> that opens its own connection on the
+		/// first publish, using the <c>DouglasMQ</c> section of <paramref name="configuration"/>. Starts no
+		/// consumers and declares nothing, so it suits an API that sends commands to a separate worker.
+		/// </summary>
+		/// <param name="services">The service collection.</param>
+		/// <param name="configuration">Configuration containing a <c>DouglasMQ</c> section.</param>
+		/// <param name="serializer">
+		/// The <see cref="ISerializer"/> implementation, or <c>null</c> for <see cref="SystemTextJsonSerializer"/>
+		/// unless another serializer is registered.
+		/// </param>
+		/// <remarks>
+		/// Building the container and starting the host never touch the network, so an unreachable broker
+		/// does not stop the app starting; the first publish fails instead, and the next one tries again.
+		/// Use <see cref="DouglasMQHealthCheckExtensions.AddDouglasMQPublisherCheck"/> to report the
+		/// connection on a readiness probe. Calling this as well as <c>AddDouglasMQ</c> is harmless: both
+		/// register the same single publisher, configured by whichever call comes first.
+		/// </remarks>
+		public static IServiceCollection AddDouglasMQPublisher(this IServiceCollection services,
+			IConfiguration configuration,
+			Type? serializer = null)
+		{
+			ArgumentNullException.ThrowIfNull(configuration);
+
+			var config = new Configuration();
+			configuration.GetSection(DouglasMQ).Bind(config);
+
+			if (serializer is not null)
+			{
+				services.AddSerializer(serializer);
+			}
+
+			return services.AddDouglasMQPublisher(config);
+		}
+
+		/// <summary>
+		/// Registers only the publisher, configured in code. See
+		/// <see cref="AddDouglasMQPublisher(IServiceCollection, IConfiguration, Type)"/>.
+		/// </summary>
+		public static IServiceCollection AddDouglasMQPublisher(this IServiceCollection services,
+			Action<Configuration> configure)
+		{
+			ArgumentNullException.ThrowIfNull(configure);
+
+			var config = new Configuration();
+			configure(config);
+			return services.AddDouglasMQPublisher(config);
+		}
+
+		private static IServiceCollection AddDouglasMQPublisher(this IServiceCollection services, Configuration configuration)
+		{
+			services.TryAddSingleton(configuration);
+			services.TryAddSingleton<ISerializer, SystemTextJsonSerializer>();
+			return services.AddLazyPublisher(configuration);
+		}
+
+		/// <summary>
+		/// The publisher gets its own lazily-opened connection rather than sharing the consumer connection,
+		/// so it keeps working while the host is stopping (when the Dispatcher closes the consumer
+		/// connection) and resolving it never blocks. The container disposes it. TryAdd, so registering
+		/// both the publisher and the consumers yields one publisher.
+		/// </summary>
+		private static IServiceCollection AddLazyPublisher(this IServiceCollection services, Configuration configuration)
+		{
+			services.TryAddSingleton(provider => Publisher.Create(
+				configuration,
+				provider.GetRequiredService<ISerializer>(),
+				provider.GetRequiredService<ILogger<Publisher>>()));
+			services.TryAddSingleton<IPublisher>(provider => provider.GetRequiredService<Publisher>());
+			return services;
+		}
+
+		/// <summary>
 		/// Registers a serializer implementation.
 		/// </summary>
 		public static IServiceCollection AddSerializer(this IServiceCollection services, Type serializer)
@@ -141,13 +213,7 @@ namespace DouglasMQ
 				// AddSerializer uses AddSingleton, and the last registration wins).
 				.TryAddSingletonFluent<ISerializer, SystemTextJsonSerializer>()
 				.AddSingleton<IReadOnlyList<HandlerRegistration>>(provider => CreateRegistrations(services, provider))
-				// The publisher gets its own lazily-opened connection rather than sharing the consumer
-				// connection, so it keeps working while the host is stopping (when the Dispatcher closes
-				// the consumer connection) and resolving it never blocks. The container disposes it.
-				.AddSingleton<IPublisher>(provider => Publisher.Create(
-					configuration,
-					provider.GetRequiredService<ISerializer>(),
-					provider.GetRequiredService<ILogger<Publisher>>()))
+				.AddLazyPublisher(configuration)
 				// The Dispatcher opens (and owns) the consumer connection in the background once the host
 				// starts it, retrying while the broker is unreachable, so neither building the container nor
 				// starting the host blocks on (or fails because of) the network.

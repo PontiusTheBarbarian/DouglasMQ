@@ -53,7 +53,11 @@ namespace DouglasMQ
 		/// A handler's own <see cref="OperationCanceledException"/> (e.g. an HTTP timeout) while this token
 		/// is not cancelled counts as an ordinary failure.
 		/// </param>
-		public async Task<DeliveryOutcome> ProcessAsync(ReadOnlyMemory<byte> body, DeliveryInfo delivery, CancellationToken stoppingToken)
+		/// <param name="handlerToken">
+		/// Passed to the handler. The consumer cancels it only after <paramref name="stoppingToken"/>, once
+		/// it has given up waiting for running handlers, so a stop lets handlers finish first.
+		/// </param>
+		public async Task<DeliveryOutcome> ProcessAsync(ReadOnlyMemory<byte> body, DeliveryInfo delivery, CancellationToken stoppingToken, CancellationToken handlerToken = default)
 		{
 			var telemetry = delivery.Telemetry;
 			object? message;
@@ -115,10 +119,10 @@ namespace DouglasMQ
 				using var logScope = BeginMessageScope(identity);
 				try
 				{
-					await _invoker.InvokeAsync(message);
+					await _invoker.InvokeAsync(message, handlerToken);
 					return DeliveryOutcome.Ack;
 				}
-				catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+				catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested || handlerToken.IsCancellationRequested)
 				{
 					return Abandon();
 				}
