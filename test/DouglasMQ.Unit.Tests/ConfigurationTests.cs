@@ -79,9 +79,9 @@ namespace DouglasMQ.Unit.Tests
 		}
 
 		[Fact]
-		public void Default_PublisherConfirms_IsFalse()
+		public void Default_PublisherConfirms_IsTrue()
 		{
-			Assert.False(new Configuration().PublisherConfirms);
+			Assert.True(new Configuration().PublisherConfirms);
 		}
 
 		[Theory]

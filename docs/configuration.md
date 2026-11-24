@@ -14,7 +14,7 @@ All settings live in the `DouglasMQ.Configuration` class. When using Microsoft D
     "PrefetchCount": 20,
     "RetryCount": 5,
     "RetryDelayMs": 500,
-    "PublisherConfirms": false
+    "PublisherConfirms": true
   }
 }
 ```
@@ -37,7 +37,7 @@ All settings live in the `DouglasMQ.Configuration` class. When using Microsoft D
 | `PrefetchCount` | `ushort` | `10` | Maximum number of unacknowledged messages delivered to each consumer channel at once. Lower values reduce memory pressure; higher values increase throughput. |
 | `RetryCount` | `int` | `3` | Number of retry attempts before a message is dead-lettered. Set to `0` to disable retries. |
 | `RetryDelayMs` | `int` | `1000` | Base delay in milliseconds between retry attempts. The actual delay for attempt *n* is `RetryDelayMs × 2^(n-1)` (exponential backoff). |
-| `PublisherConfirms` | `bool` | `false` | When `true`, the publisher waits for the broker to confirm persistence of each message before `PublishAsync` / `SendAsync` returns. Has a performance cost — use only when at-least-once delivery is critical. |
+| `PublisherConfirms` | `bool` | `true` | When `true`, the publisher waits for the broker to confirm each message before `PublishAsync` / `SendAsync` returns, and a message no queue is bound for throws `UnroutableMessageException`. Set `false` for lower latency; unroutable messages are then only logged at Error. See [Publishing](publishing.md#unroutable-messages). |
 
 ## Programmatic configuration (without DI)
 
